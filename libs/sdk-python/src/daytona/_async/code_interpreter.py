@@ -6,13 +6,14 @@ from __future__ import annotations
 import json
 import re
 
-from daytona_toolbox_api_client_async import CreateContextRequest, InterpreterApi, InterpreterContext
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
+from daytona_toolbox_api_client_async import CreateContextRequest, InterpreterApi, InterpreterContext
+
 from .._utils.errors import intercept_errors
 from ..common.code_interpreter import ExecutionError, ExecutionResult, OutputMessage
-from ..common.errors import DaytonaError, DaytonaTimeoutError
+from ..common.errors import DaytonaConnectionError, DaytonaTimeoutError
 from ..common.process import OutputHandler
 
 WEBSOCKET_TIMEOUT_CODE = 4008
@@ -252,7 +253,7 @@ class AsyncCodeInterpreter:
         _ = await self._api_client.delete_interpreter_context(id=context.id)
 
     def _raise_from_ws_close(self, error: ConnectionClosed) -> None:
-        """Raise an appropriate Daytona error from a websocket close event."""
+        """Raise the appropriate Daytona timeout or connection error from a websocket close event."""
         code = None
         reason = None
         if error.rcvd is not None:
@@ -270,4 +271,4 @@ class AsyncCodeInterpreter:
         detail = reason or "WebSocket connection closed unexpectedly"
         if code is not None:
             detail = f"{detail} (close code {code})"
-        raise DaytonaError(detail)
+        raise DaytonaConnectionError(detail)

@@ -8,6 +8,7 @@ import { InjectRepository } from '@nestjs/typeorm'
 import { Repository } from 'typeorm'
 import { Snapshot } from '../entities/snapshot.entity'
 import { SnapshotRunner } from '../entities/snapshot-runner.entity'
+import { SnapshotRepository } from '../repositories/snapshot.repository'
 import { SandboxState } from '../enums/sandbox-state.enum'
 import { SnapshotState } from '../enums/snapshot-state.enum'
 import { SnapshotRunnerState } from '../enums/snapshot-runner-state.enum'
@@ -34,8 +35,7 @@ export class JobStateHandlerService {
 
   constructor(
     private readonly sandboxRepository: SandboxRepository,
-    @InjectRepository(Snapshot)
-    private readonly snapshotRepository: Repository<Snapshot>,
+    private readonly snapshotRepository: SnapshotRepository,
     @InjectRepository(SnapshotRunner)
     private readonly snapshotRunnerRepository: Repository<SnapshotRunner>,
     private readonly organizationUsageService: OrganizationUsageService,
@@ -129,6 +129,9 @@ export class JobStateHandlerService {
         )
         updateData.state = SandboxState.STARTED
         updateData.errorReason = null
+        if ([BackupState.ERROR, BackupState.COMPLETED].includes(sandbox.backupState)) {
+          Object.assign(updateData, Sandbox.getBackupStateUpdate(sandbox, BackupState.NONE))
+        }
         const metadata = job.getResultMetadata()
         if (metadata?.daemonVersion && typeof metadata.daemonVersion === 'string') {
           updateData.daemonVersion = metadata.daemonVersion
@@ -171,6 +174,9 @@ export class JobStateHandlerService {
         this.logger.debug(`START_SANDBOX job ${job.id} completed successfully, marking sandbox ${sandboxId} as STARTED`)
         updateData.state = SandboxState.STARTED
         updateData.errorReason = null
+        if ([BackupState.ERROR, BackupState.COMPLETED].includes(sandbox.backupState)) {
+          Object.assign(updateData, Sandbox.getBackupStateUpdate(sandbox, BackupState.NONE))
+        }
         const metadata = job.getResultMetadata()
         if (metadata?.daemonVersion && typeof metadata.daemonVersion === 'string') {
           updateData.daemonVersion = metadata.daemonVersion
@@ -213,6 +219,7 @@ export class JobStateHandlerService {
         this.logger.debug(`STOP_SANDBOX job ${job.id} completed successfully, marking sandbox ${sandboxId} as STOPPED`)
         updateData.state = SandboxState.STOPPED
         updateData.errorReason = null
+        Object.assign(updateData, Sandbox.getBackupStateUpdate(sandbox, BackupState.NONE))
       } else if (job.status === JobStatus.FAILED) {
         this.logger.error(`STOP_SANDBOX job ${job.id} failed for sandbox ${sandboxId}: ${job.errorMessage}`)
         updateData.state = SandboxState.ERROR
@@ -237,25 +244,39 @@ export class JobStateHandlerService {
         this.logger.warn(`Sandbox ${sandboxId} not found for DESTROY_SANDBOX job ${job.id}`)
         return
       }
-      if (sandbox.desiredState !== SandboxDesiredState.DESTROYED) {
-        // Don't log anything because sandboxes can be destroyed on runners when archiving or moving to a new runner
-        return
-      }
-
       const updateData: Partial<Sandbox> = {}
 
-      if (job.status === JobStatus.COMPLETED) {
-        this.logger.debug(
-          `DESTROY_SANDBOX job ${job.id} completed successfully, marking sandbox ${sandboxId} as DESTROYED`,
-        )
-        updateData.state = SandboxState.DESTROYED
+      if (sandbox.desiredState === SandboxDesiredState.DESTROYED) {
+        if (job.status === JobStatus.COMPLETED) {
+          this.logger.debug(
+            `DESTROY_SANDBOX job ${job.id} completed successfully, marking sandbox ${sandboxId} as DESTROYED`,
+          )
+          updateData.state = SandboxState.DESTROYED
+          updateData.errorReason = null
+        } else if (job.status === JobStatus.FAILED) {
+          this.logger.error(`DESTROY_SANDBOX job ${job.id} failed for sandbox ${sandboxId}: ${job.errorMessage}`)
+          updateData.state = SandboxState.ERROR
+          const { recoverable, errorReason } = sanitizeSandboxError(job.errorMessage)
+          updateData.errorReason = errorReason || 'Failed to destroy sandbox'
+          updateData.recoverable = recoverable
+        }
+      } else if (
+        sandbox.desiredState === SandboxDesiredState.ARCHIVED &&
+        sandbox.backupState === BackupState.COMPLETED
+      ) {
+        if (job.status === JobStatus.COMPLETED) {
+          this.logger.debug(
+            `DESTROY_SANDBOX job ${job.id} completed during archiving, marking sandbox ${sandboxId} as ARCHIVED`,
+          )
+        } else if (job.status === JobStatus.FAILED) {
+          this.logger.warn(
+            `DESTROY_SANDBOX job ${job.id} failed during archiving for sandbox ${sandboxId}: ${job.errorMessage}. Marking as ARCHIVED since backup is complete.`,
+          )
+        }
+        updateData.state = SandboxState.ARCHIVED
         updateData.errorReason = null
-      } else if (job.status === JobStatus.FAILED) {
-        this.logger.error(`DESTROY_SANDBOX job ${job.id} failed for sandbox ${sandboxId}: ${job.errorMessage}`)
-        updateData.state = SandboxState.ERROR
-        const { recoverable, errorReason } = sanitizeSandboxError(job.errorMessage)
-        updateData.errorReason = errorReason || 'Failed to destroy sandbox'
-        updateData.recoverable = recoverable
+      } else {
+        return
       }
 
       await this.sandboxRepository.update(sandboxId, { updateData, entity: sandbox })
@@ -292,10 +313,12 @@ export class JobStateHandlerService {
         })
         if (snapshot && (snapshot.state === SnapshotState.PULLING || snapshot.state === SnapshotState.BUILDING)) {
           this.logger.debug(`Marking snapshot ${snapshot.id} as ACTIVE after initial pull completed`)
-          snapshot.state = SnapshotState.ACTIVE
-          snapshot.errorReason = null
-          snapshot.lastUsedAt = new Date()
-          await this.snapshotRepository.save(snapshot)
+          const updateData: Partial<Snapshot> = {
+            state: SnapshotState.ACTIVE,
+            errorReason: null,
+            lastUsedAt: new Date(),
+          }
+          await this.snapshotRepository.update(snapshot.id, { updateData, entity: snapshot })
         }
       } else if (job.status === JobStatus.FAILED) {
         this.logger.error(`PULL_SNAPSHOT job ${job.id} failed for snapshot ${snapshotRef}: ${job.errorMessage}`)
@@ -308,9 +331,11 @@ export class JobStateHandlerService {
         })
         if (snapshot && snapshot.state === SnapshotState.PULLING) {
           this.logger.error(`Marking snapshot ${snapshot.id} as ERROR after initial pull failed`)
-          snapshot.state = SnapshotState.ERROR
-          snapshot.errorReason = job.errorMessage || 'Failed to pull snapshot on initial runner'
-          await this.snapshotRepository.save(snapshot)
+          const updateData: Partial<Snapshot> = {
+            state: SnapshotState.ERROR,
+            errorReason: job.errorMessage || 'Failed to pull snapshot on initial runner',
+          }
+          await this.snapshotRepository.update(snapshot.id, { updateData, entity: snapshot })
         }
       }
 
@@ -343,10 +368,12 @@ export class JobStateHandlerService {
         this.logger.debug(`BUILD_SNAPSHOT job ${job.id} completed successfully for snapshot ref ${snapshotRef}`)
 
         if (snapshot?.state === SnapshotState.BUILDING) {
-          snapshot.state = SnapshotState.ACTIVE
-          snapshot.errorReason = null
-          snapshot.lastUsedAt = new Date()
-          await this.snapshotRepository.save(snapshot)
+          const updateData: Partial<Snapshot> = {
+            state: SnapshotState.ACTIVE,
+            errorReason: null,
+            lastUsedAt: new Date(),
+          }
+          await this.snapshotRepository.update(snapshot.id, { updateData, entity: snapshot })
           this.logger.debug(`Marked snapshot ${snapshot.id} as ACTIVE after build completed`)
         }
 
@@ -359,9 +386,11 @@ export class JobStateHandlerService {
         this.logger.error(`BUILD_SNAPSHOT job ${job.id} failed for snapshot ref ${snapshotRef}: ${job.errorMessage}`)
 
         if (snapshot?.state === SnapshotState.BUILDING) {
-          snapshot.state = SnapshotState.ERROR
-          snapshot.errorReason = job.errorMessage || 'Failed to build snapshot'
-          await this.snapshotRepository.save(snapshot)
+          const updateData: Partial<Snapshot> = {
+            state: SnapshotState.ERROR,
+            errorReason: job.errorMessage || 'Failed to build snapshot',
+          }
+          await this.snapshotRepository.update(snapshot.id, { updateData, entity: snapshot })
         }
 
         if (snapshotRunner) {
@@ -473,6 +502,9 @@ export class JobStateHandlerService {
         )
         updateData.state = SandboxState.STARTED
         updateData.errorReason = null
+        if ([BackupState.ERROR, BackupState.COMPLETED].includes(sandbox.backupState)) {
+          Object.assign(updateData, Sandbox.getBackupStateUpdate(sandbox, BackupState.NONE))
+        }
       } else if (job.status === JobStatus.FAILED) {
         this.logger.error(`RECOVER_SANDBOX job ${job.id} failed for sandbox ${sandboxId}: ${job.errorMessage}`)
         updateData.state = SandboxState.ERROR
@@ -546,7 +578,6 @@ export class JobStateHandlerService {
           memDeltaForQuota,
           diskDeltaForQuota,
         )
-        return
       } else if (job.status === JobStatus.FAILED) {
         this.logger.error(`RESIZE_SANDBOX job ${job.id} failed for sandbox ${sandboxId}: ${job.errorMessage}`)
 

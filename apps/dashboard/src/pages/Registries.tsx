@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
+import { UpsertRegistrySheet } from '@/components/UpsertRegistrySheet'
+import { type CommandConfig, useRegisterCommands } from '@/components/CommandPalette'
 import { PageContent, PageHeader, PageLayout, PageTitle } from '@/components/PageLayout'
 import { RegistryTable } from '@/components/RegistryTable'
 import { Button } from '@/components/ui/button'
@@ -15,139 +17,42 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useApi } from '@/hooks/useApi'
+import { useDeleteRegistryMutation } from '@/hooks/mutations/useDeleteRegistryMutation'
+import { useRegistriesQuery } from '@/hooks/queries/useRegistriesQuery'
 import { useSelectedOrganization } from '@/hooks/useSelectedOrganization'
 import { handleApiError } from '@/lib/error-handling'
-import {
-  DockerRegistryRegistryTypeEnum,
-  OrganizationRolePermissionsEnum,
-  type DockerRegistry,
-} from '@daytonaio/api-client'
-import { Info, Plus } from 'lucide-react'
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import { OrganizationRolePermissionsEnum, type DockerRegistry } from '@daytona/api-client'
+import { PlusIcon } from 'lucide-react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 
 const Registries: React.FC = () => {
-  const { dockerRegistryApi } = useApi()
-  const [registries, setRegistries] = useState<DockerRegistry[]>([])
-  const [loading, setLoading] = useState(true)
   const [registryToDelete, setRegistryToDelete] = useState<string | null>(null)
-  const [formData, setFormData] = useState({
-    name: '',
-    url: '',
-    username: '',
-    password: '',
-    project: '',
-  })
   const [registryToEdit, setRegistryToEdit] = useState<DockerRegistry | null>(null)
-  const [showCreateOrEditDialog, setShowCreateOrEditDialog] = useState(false)
-  const [actionInProgress, setActionInProgress] = useState(false)
+  const [showEditSheet, setShowEditSheet] = useState(false)
+  const addRegistrySheetRef = useRef<{ open: () => void }>(null)
 
   const { selectedOrganization, authenticatedUserHasPermission } = useSelectedOrganization()
-
-  const fetchRegistries = useCallback(
-    async (showTableLoadingState = true) => {
-      if (!selectedOrganization) {
-        return
-      }
-      if (showTableLoadingState) {
-        setLoading(true)
-      }
-      try {
-        const response = await dockerRegistryApi.listRegistries(selectedOrganization.id)
-        setRegistries(response.data)
-      } catch (error) {
-        handleApiError(error, 'Failed to fetch registries')
-      } finally {
-        setLoading(false)
-      }
-    },
-    [dockerRegistryApi, selectedOrganization],
-  )
+  const { data: registries = [], isLoading: loading, error: registriesError } = useRegistriesQuery()
+  const deleteRegistryMutation = useDeleteRegistryMutation()
+  const deleteInProgress = deleteRegistryMutation.isPending
 
   useEffect(() => {
-    fetchRegistries()
-  }, [fetchRegistries])
-
-  const handleCreate = async () => {
-    setActionInProgress(true)
-    try {
-      await dockerRegistryApi.createRegistry(
-        {
-          name: formData.name.trim(),
-          url: formData.url.trim() || 'docker.io',
-          username: formData.username.trim(),
-          password: formData.password.trim(),
-          project: formData.project.trim(),
-          registryType: DockerRegistryRegistryTypeEnum.ORGANIZATION,
-        },
-        selectedOrganization?.id,
-      )
-      toast.success('Registry created successfully')
-      await fetchRegistries(false)
-      setShowCreateOrEditDialog(false)
-      setFormData({
-        name: '',
-        url: '',
-        username: '',
-        password: '',
-        project: '',
-      })
-    } catch (error) {
-      handleApiError(error, 'Failed to create registry')
-    } finally {
-      setActionInProgress(false)
+    if (registriesError) {
+      handleApiError(registriesError, 'Failed to fetch registries')
     }
-  }
-
-  const handleEdit = async () => {
-    if (!registryToEdit) return
-
-    setActionInProgress(true)
-    try {
-      await dockerRegistryApi.updateRegistry(
-        registryToEdit.id,
-        {
-          name: formData.name.trim(),
-          url: formData.url.trim() || 'docker.io',
-          username: formData.username.trim(),
-          password: formData.password.trim(),
-          project: formData.project.trim(),
-        },
-        selectedOrganization?.id,
-      )
-      toast.success('Registry edited successfully')
-      await fetchRegistries(false)
-      setShowCreateOrEditDialog(false)
-      setRegistryToEdit(null)
-      setFormData({
-        name: '',
-        url: '',
-        username: '',
-        password: '',
-        project: '',
-      })
-    } catch (error) {
-      handleApiError(error, 'Failed to edit registry')
-    } finally {
-      setActionInProgress(false)
-    }
-  }
+  }, [registriesError])
 
   const handleDelete = async (id: string) => {
-    setActionInProgress(true)
     try {
-      await dockerRegistryApi.deleteRegistry(id, selectedOrganization?.id)
+      await deleteRegistryMutation.mutateAsync({
+        registryId: id,
+        organizationId: selectedOrganization?.id,
+      })
       toast.success('Registry deleted successfully')
-      await fetchRegistries(false)
       setRegistryToDelete(null)
     } catch (error) {
       handleApiError(error, 'Failed to delete registry')
-    } finally {
-      setActionInProgress(false)
     }
   }
 
@@ -156,188 +61,53 @@ const Registries: React.FC = () => {
     [authenticatedUserHasPermission],
   )
 
-  const dialogContent = (
-    <DialogContent>
-      <DialogHeader>
-        <DialogTitle>{registryToEdit ? 'Edit Registry' : 'Add Registry'}</DialogTitle>
-        <DialogDescription>
-          Registry details must be provided for images that are not publicly available.
-        </DialogDescription>
-      </DialogHeader>
-      <form
-        id="registry-form"
-        className="space-y-6 overflow-y-auto px-1 pb-1"
-        onSubmit={async (e) => {
-          e.preventDefault()
-          if (registryToEdit) {
-            await handleEdit()
-          } else {
-            await handleCreate()
-          }
-        }}
-      >
-        <div className="space-y-3">
-          <Label htmlFor="name">Registry Name</Label>
-          <Input
-            id="name"
-            value={formData.name}
-            onChange={(e) => setFormData((prev) => ({ ...prev, name: e.target.value }))}
-            placeholder="My Registry"
-            required
-          />
-        </div>
-        <div className="space-y-3">
-          <div className="flex items-center gap-1.5">
-            <Label htmlFor="url">Registry URL</Label>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Info className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
-              </TooltipTrigger>
-              <TooltipContent>
-                <p>Defaults to docker.io when left blank</p>
-              </TooltipContent>
-            </Tooltip>
-          </div>
-          <Input
-            id="url"
-            value={formData.url}
-            onChange={(e) => setFormData((prev) => ({ ...prev, url: e.target.value }))}
-            placeholder="https://registry.example.com"
-          />
-        </div>
-        <div className="space-y-3">
-          <Label htmlFor="username">Username</Label>
-          <Input
-            id="username"
-            value={formData.username}
-            onChange={(e) => setFormData((prev) => ({ ...prev, username: e.target.value }))}
-            required
-          />
-        </div>
-        <div className="space-y-3">
-          <Label htmlFor="password">Password</Label>
-          <Input
-            id="password"
-            type="password"
-            value={formData.password}
-            onChange={(e) => setFormData((prev) => ({ ...prev, password: e.target.value }))}
-            required={!registryToEdit}
-          />
-          {registryToEdit && <p className="text-sm text-gray-500">Leave empty to keep the current password.</p>}
-        </div>
-        <div className="space-y-3">
-          <div className="flex items-center gap-1.5">
-            <Label htmlFor="project">Project</Label>
+  const rootCommands: CommandConfig[] = useMemo(() => {
+    if (!writePermitted) {
+      return []
+    }
 
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Info className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
-              </TooltipTrigger>
-              <TooltipContent>
-                <p>Leave this empty for private Docker Hub entries</p>
-              </TooltipContent>
-            </Tooltip>
-          </div>
-          <Input
-            id="project"
-            value={formData.project}
-            onChange={(e) => setFormData((prev) => ({ ...prev, project: e.target.value }))}
-            placeholder="my-project"
-          />
-        </div>
-      </form>
-      <DialogFooter>
-        <DialogClose asChild>
-          <Button type="button" variant="secondary">
-            Cancel
-          </Button>
-        </DialogClose>
-        {actionInProgress ? (
-          <Button type="button" variant="default" disabled>
-            {registryToEdit ? 'Editing...' : 'Adding...'}
-          </Button>
-        ) : (
-          <Button
-            type="submit"
-            form="registry-form"
-            variant="default"
-            disabled={
-              !formData.name.trim() || !formData.username.trim() || (!registryToEdit && !formData.password.trim())
-            }
-          >
-            {registryToEdit ? 'Edit' : 'Add'}
-          </Button>
-        )}
-      </DialogFooter>
-    </DialogContent>
-  )
+    return [
+      {
+        id: 'add-registry',
+        label: 'Add Registry',
+        icon: <PlusIcon className="w-4 h-4" />,
+        onSelect: () => addRegistrySheetRef.current?.open(),
+      },
+    ]
+  }, [writePermitted])
+
+  useRegisterCommands(rootCommands, { groupId: 'registry-actions', groupLabel: 'Registry actions', groupOrder: 0 })
 
   return (
     <PageLayout>
       <PageHeader>
         <PageTitle>Registries</PageTitle>
-        {writePermitted && (
-          <Button
-            variant="default"
-            size="sm"
-            disabled={loading}
-            className="ml-auto"
-            title="Add Registry"
-            onClick={() => {
-              setShowCreateOrEditDialog(true)
-              setFormData({
-                name: '',
-                url: '',
-                username: '',
-                password: '',
-                project: '',
-              })
-            }}
-          >
-            <Plus className="w-4 h-4" />
-            Add Registry
-          </Button>
-        )}
+        {writePermitted && <UpsertRegistrySheet className="ml-auto" disabled={loading} ref={addRegistrySheetRef} />}
       </PageHeader>
 
       <PageContent size="full">
-        <Dialog
-          open={showCreateOrEditDialog}
-          onOpenChange={(isOpen) => {
-            setShowCreateOrEditDialog(isOpen)
-            if (isOpen) {
-              return
-            }
-
-            setRegistryToDelete(null)
-            setRegistryToEdit(null)
-            setFormData({
-              name: '',
-              url: '',
-              username: '',
-              password: '',
-              project: '',
-            })
+        <RegistryTable
+          data={registries}
+          loading={loading}
+          onDelete={(id) => setRegistryToDelete(id)}
+          onEdit={(registry) => {
+            setRegistryToEdit(registry)
+            setShowEditSheet(true)
           }}
-        >
-          {writePermitted && dialogContent}
+        />
 
-          <RegistryTable
-            data={registries}
-            loading={loading}
-            onDelete={(id) => setRegistryToDelete(id)}
-            onEdit={(registry) => {
-              setFormData({
-                name: registry.name,
-                url: registry.url,
-                username: registry.username,
-                password: '',
-                project: registry.project,
-              })
-              setRegistryToEdit(registry)
-            }}
-          />
-        </Dialog>
+        <UpsertRegistrySheet
+          mode="edit"
+          trigger={null}
+          open={showEditSheet}
+          onOpenChange={(isOpen) => {
+            setShowEditSheet(isOpen)
+            if (!isOpen) {
+              setRegistryToEdit(null)
+            }
+          }}
+          registry={registryToEdit}
+        />
 
         <Dialog
           open={!!registryToDelete}
@@ -369,9 +139,9 @@ const Registries: React.FC = () => {
                     handleDelete(registryToDelete)
                   }
                 }}
-                disabled={actionInProgress}
+                disabled={deleteInProgress}
               >
-                {actionInProgress ? 'Deleting...' : 'Delete'}
+                {deleteInProgress ? 'Deleting...' : 'Delete'}
               </Button>
             </DialogFooter>
           </DialogContent>

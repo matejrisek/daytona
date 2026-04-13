@@ -18,11 +18,14 @@ import pprint
 import re  # noqa: F401
 import json
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 from typing import Any, ClassVar, Dict, List, Optional
 from daytona_api_client.models.create_build_info import CreateBuildInfo
+from pydantic import TypeAdapter
 from typing import Optional, Set
 from typing_extensions import Self
+
+_JSON_ADAPTER = TypeAdapter(Dict[str, Any])
 
 class CreateSnapshot(BaseModel):
     """
@@ -31,7 +34,6 @@ class CreateSnapshot(BaseModel):
     name: StrictStr = Field(description="The name of the snapshot")
     image_name: Optional[StrictStr] = Field(default=None, description="The image name of the snapshot", serialization_alias="imageName")
     entrypoint: Optional[List[StrictStr]] = Field(default=None, description="The entrypoint command for the snapshot")
-    general: Optional[StrictBool] = Field(default=None, description="Whether the snapshot is general")
     cpu: Optional[StrictInt] = Field(default=None, description="CPU cores allocated to the resulting sandbox")
     gpu: Optional[StrictInt] = Field(default=None, description="GPU units allocated to the resulting sandbox")
     memory: Optional[StrictInt] = Field(default=None, description="Memory allocated to the resulting sandbox in GB")
@@ -39,7 +41,7 @@ class CreateSnapshot(BaseModel):
     build_info: Optional[CreateBuildInfo] = Field(default=None, description="Build information for the snapshot", serialization_alias="buildInfo")
     region_id: Optional[StrictStr] = Field(default=None, description="ID of the region where the snapshot will be available. Defaults to organization default region if not specified.", serialization_alias="regionId")
     additional_properties: Dict[str, Any] = {}
-    __properties: ClassVar[List[str]] = ["name", "imageName", "entrypoint", "general", "cpu", "gpu", "memory", "disk", "buildInfo", "regionId"]
+    __properties: ClassVar[List[str]] = ["name", "imageName", "entrypoint", "cpu", "gpu", "memory", "disk", "buildInfo", "regionId"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -54,8 +56,7 @@ class CreateSnapshot(BaseModel):
 
     def to_json(self) -> str:
         """Returns the JSON representation of the model using alias"""
-        # TODO: pydantic v2: use .model_dump_json(by_alias=True, exclude_unset=True) instead
-        return json.dumps(self.to_dict())
+        return _JSON_ADAPTER.dump_json(self.to_dict()).decode()
 
     @classmethod
     def from_json(cls, json_str: str) -> Optional[Self]:
@@ -105,7 +106,6 @@ class CreateSnapshot(BaseModel):
             "name": obj.get("name"),
             "image_name": obj.get("imageName"),
             "entrypoint": obj.get("entrypoint"),
-            "general": obj.get("general"),
             "cpu": obj.get("cpu"),
             "gpu": obj.get("gpu"),
             "memory": obj.get("memory"),

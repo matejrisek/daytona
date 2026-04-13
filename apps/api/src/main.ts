@@ -11,6 +11,7 @@ import { AppModule } from './app.module'
 import { SwaggerModule } from '@nestjs/swagger'
 import { INestApplication, Logger, ValidationPipe } from '@nestjs/common'
 import { AllExceptionsFilter } from './filters/all-exceptions.filter'
+import { ContentTypeInterceptor } from './common/interceptors/content-type.interceptors'
 import { MetricsInterceptor } from './interceptors/metrics.interceptor'
 import { HttpsOptions } from '@nestjs/common/interfaces/external/https-options.interface'
 import { TypedConfigService } from './config/typed-config.service'
@@ -22,6 +23,7 @@ import { join } from 'node:path'
 import { ApiKeyService } from './api-key/api-key.service'
 import { DAYTONA_ADMIN_USER_ID } from './app.service'
 import { OrganizationService } from './organization/services/organization.service'
+import { OrganizationResourcePermission } from './organization/enums/organization-resource-permission.enum'
 import { MicroserviceOptions, Transport } from '@nestjs/microservices'
 import { Partitioners } from 'kafkajs'
 import { isApiEnabled, isWorkerEnabled } from './common/utils/app-mode'
@@ -56,6 +58,7 @@ async function bootstrap() {
   app.set('trust proxy', true)
   app.useGlobalFilters(new AllExceptionsFilter(failedAuthTracker))
   app.useGlobalInterceptors(new LoggerErrorInterceptor())
+  app.useGlobalInterceptors(new ContentTypeInterceptor())
   app.useGlobalInterceptors(new MetricsInterceptor(configService))
   app.useGlobalInterceptors(app.get(AuditInterceptor))
   app.useGlobalPipes(
@@ -187,7 +190,12 @@ async function createAdminApiKey(app: INestApplication, apiKeyName: string) {
   const organizationService = app.get(OrganizationService)
 
   const personalOrg = await organizationService.findPersonal(DAYTONA_ADMIN_USER_ID)
-  const { value } = await apiKeyService.createApiKey(personalOrg.id, DAYTONA_ADMIN_USER_ID, apiKeyName, [])
+  const { value } = await apiKeyService.createApiKey(
+    personalOrg.id,
+    DAYTONA_ADMIN_USER_ID,
+    apiKeyName,
+    Object.values(OrganizationResourcePermission),
+  )
   Logger.log(
     `
 =========================================

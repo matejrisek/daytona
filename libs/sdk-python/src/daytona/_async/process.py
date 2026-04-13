@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -9,6 +10,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 import websockets
+from websockets.asyncio.client import connect
+
 from daytona_toolbox_api_client_async import (
     Command,
     CreateSessionRequest,
@@ -20,7 +23,6 @@ from daytona_toolbox_api_client_async import (
     Session,
     SessionSendInputRequest,
 )
-from websockets.asyncio.client import connect
 
 from .._utils.errors import intercept_errors
 from .._utils.otel_decorator import with_instrumentation
@@ -139,7 +141,7 @@ class AsyncProcess:
             safe_env_exports = (
                 " ".join(
                     [
-                        f"""export {key}="$(echo '{base64.b64encode(value.encode()).decode()}' | base64 -d)";"""
+                        f"""export {key}="$(printf '%s' '{base64.b64encode(value.encode()).decode()}' | base64 -d)";"""
                         for key, value in env.items()
                     ]
                 )
@@ -149,7 +151,10 @@ class AsyncProcess:
 
         execute_request = ExecuteRequest(command=command, cwd=cwd, timeout=timeout)
 
-        response = await self._api_client.execute_command(request=execute_request)
+        response = await self._api_client.execute_command(
+            request=execute_request,
+            _request_timeout=http_timeout(timeout + 5 if timeout else None),
+        )
 
         # Post-process the output to extract ExecutionArtifacts
         artifacts = AsyncProcess._parse_output(response.result.split("\n"))
@@ -375,10 +380,12 @@ class AsyncProcess:
         response = await self._api_client.session_execute_command(
             session_id=session_id,
             request=req,
-            _request_timeout=http_timeout(timeout),
+            _request_timeout=http_timeout(timeout + 5 if timeout else None),
         )
 
-        stdout, stderr = demux_log(response.output.encode("utf-8", "ignore") if response.output else b"")
+        loop = asyncio.get_running_loop()
+        raw = response.output.encode("utf-8", "ignore") if response.output else b""
+        stdout, stderr = await loop.run_in_executor(None, demux_log, raw)
 
         return SessionExecuteResponse.model_construct(
             cmd_id=response.cmd_id,
@@ -421,7 +428,8 @@ class AsyncProcess:
         response = cast(Any, response)
         response.data = await response.content.read()
 
-        return parse_session_command_logs(response.data)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, parse_session_command_logs, response.data)
 
     @intercept_errors(message_prefix="Failed to get session command logs: ")
     async def get_session_command_logs_async(
@@ -487,7 +495,8 @@ class AsyncProcess:
         response = cast(Any, response)
         response.data = await response.content.read()
 
-        return parse_session_command_logs(response.data)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, parse_session_command_logs, response.data)
 
     @intercept_errors(message_prefix="Failed to get entrypoint logs: ")
     async def get_entrypoint_logs_async(self, on_stdout: OutputHandler[str], on_stderr: OutputHandler[str]) -> None:

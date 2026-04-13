@@ -1,16 +1,15 @@
 ---
 title: Open Source Deployment
+description: Run Daytona Open Source locally using Docker Compose.
 ---
 
 This guide will walk you through running Daytona Open Source locally using Docker Compose.
 
 The compose file can be found in the [docker](https://github.com/daytonaio/daytona/tree/main/docker) folder of the Daytona repository.
 
-:::caution
-
-- This setup is still in development and is **not safe to use in production**
-- For a fully licensed stable version, [contact sales](https://www.daytona.io/contact)
-  :::
+:::note
+Daytona is open source under the AGPL 3.0 license. You are free to deploy and run it in any environment. If you modify Daytona, and make it available over a network, AGPL 3.0 license requires you to release your modifications under the same license. Self-hosted deployments are community-supported via GitHub and Slack. For self-hosted deployments with dedicated support, contact [support@daytona.io](mailto:support@daytona.io).
+:::
 
 ## Overview
 
@@ -65,6 +64,12 @@ This configures dnsmasq with `address=/proxy.localhost/127.0.0.1`.
 - Database and storage data is persisted in Docker volumes
 - The registry is configured to allow image deletion for testing
 - Sandbox resource limits are disabled due to inability to partition cgroups in DinD environment where the sock is not mounted
+
+## Security Considerations
+
+The `INTER_SANDBOX_NETWORK_ENABLED` runner environment variable controls whether sandboxes on the same runner can communicate over the network. In the Docker Compose configuration this defaults to `false`, creating an isolated bridge network with inter-container communication disabled.
+
+If you are deploying runners outside of the provided Docker Compose setup, ensure `INTER_SANDBOX_NETWORK_ENABLED` is explicitly set to `false` unless your use case requires inter-sandbox communication.
 
 ## Additional Network Options
 
@@ -223,6 +228,8 @@ Below is a full list of environment variables with their default values:
 | `SANDBOX_OTEL_ENDPOINT_URL`                | string  | (empty)                                              | OpenTelemetry endpoint URL for sandbox traces                                                        |
 | `HEALTH_CHECK_API_KEY`                     | string  | `supersecretkey`                                     | Authentication key for the readiness health-check route.                                             |
 | `NOTIFICATION_GATEWAY_DISABLED`            | boolean | `false`                                              | Disable notification gateway service                                                                 |
+| `FAILED_SNAPSHOT_RUNNER_RETENTION_HOURS`   | number  | `3`                                                  | Hours to retain failed snapshot runner records before cleanup                                        |
+| `BUILDINFO_SNAPSHOT_RUNNER_STALENESS_DAYS` | number  | `7`                                                  | Days of inactivity before a snapshot runner is considered stale and eligible for cleanup             |
 
 ### Runner
 
@@ -260,6 +267,7 @@ Below is a full list of environment variables with their default values:
 | `SNAPSHOT_ERROR_CACHE_RETENTION`        | string  | `10m`                             | Snapshot error cache retention duration (minimum: 5m) |
 | `CONTAINER_NETWORK`                     | string  | (none)                            | Custom docker network for sandboxes                   |
 | `INTER_SANDBOX_NETWORK_ENABLED`         | boolean | `false`                           | Enable or disable inter-sandbox network connectivity  |
+| `BUILD_ENGINE`                          | string  | `buildkit`                        | Docker image build engine (`buildkit` or `legacy`)    |
 
 ### SSH Gateway
 

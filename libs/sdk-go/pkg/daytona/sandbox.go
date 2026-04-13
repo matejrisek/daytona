@@ -252,14 +252,14 @@ func (s *Sandbox) doStartWithTimeout(ctx context.Context, timeout time.Duration)
 // Stop stops the sandbox with a default timeout of 60 seconds.
 //
 // Stopping a sandbox preserves its state. Use [Sandbox.Start] to resume.
-// For custom timeout, use [Sandbox.StopWithTimeout].
+// For custom timeout or force stop, use [Sandbox.StopWithTimeout].
 //
 // Example:
 //
 //	err := sandbox.Stop(ctx)
 func (s *Sandbox) Stop(ctx context.Context) error {
 	return withInstrumentationVoid(ctx, s.otel, "Sandbox", "Stop", func(ctx context.Context) error {
-		return s.StopWithTimeout(ctx, 60*time.Second)
+		return s.StopWithTimeout(ctx, 60*time.Second, false)
 	})
 }
 
@@ -267,17 +267,18 @@ func (s *Sandbox) Stop(ctx context.Context) error {
 //
 // The method blocks until the sandbox reaches the "stopped" state or the timeout
 // is exceeded. 0 means no timeout.
+// Set force to true to use SIGKILL instead of SIGTERM.
 //
 // Example:
 //
-//	err := sandbox.StopWithTimeout(ctx, 2*time.Minute)
-func (s *Sandbox) StopWithTimeout(ctx context.Context, timeout time.Duration) error {
+//	err := sandbox.StopWithTimeout(ctx, 2*time.Minute, false)
+func (s *Sandbox) StopWithTimeout(ctx context.Context, timeout time.Duration, force bool) error {
 	return withInstrumentationVoid(ctx, s.otel, "Sandbox", "StopWithTimeout", func(ctx context.Context) error {
-		return s.doStopWithTimeout(ctx, timeout)
+		return s.doStopWithTimeout(ctx, timeout, force)
 	})
 }
 
-func (s *Sandbox) doStopWithTimeout(ctx context.Context, timeout time.Duration) error {
+func (s *Sandbox) doStopWithTimeout(ctx context.Context, timeout time.Duration, force bool) error {
 	if timeout < 0 {
 		return errors.NewDaytonaError("Timeout must be a non-negative number", 0, nil)
 	}
@@ -289,7 +290,11 @@ func (s *Sandbox) doStopWithTimeout(ctx context.Context, timeout time.Duration) 
 	}
 
 	authCtx := s.client.getAuthContext(ctx)
-	_, httpResp, err := s.client.apiClient.SandboxAPI.StopSandbox(authCtx, s.ID).Execute()
+	req := s.client.apiClient.SandboxAPI.StopSandbox(authCtx, s.ID)
+	if force {
+		req = req.Force(force)
+	}
+	_, httpResp, err := req.Execute()
 	if err != nil {
 		return errors.ConvertAPIError(err, httpResp)
 	}
@@ -400,14 +405,16 @@ func (s *Sandbox) doWaitForStart(ctx context.Context, timeout time.Duration) err
 		defer cancel()
 	}
 
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	interval := 100 * time.Millisecond
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	startTime := time.Now()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return errors.NewDaytonaTimeoutError(fmt.Sprintf("Sandbox did not start within %s", timeout))
-		case <-ticker.C:
+		case <-timer.C:
 			if err := s.RefreshData(ctx); err != nil {
 				return err
 			}
@@ -418,6 +425,14 @@ func (s *Sandbox) doWaitForStart(ctx context.Context, timeout time.Duration) err
 			if s.State == apiclient.SANDBOXSTATE_ERROR || s.State == apiclient.SANDBOXSTATE_BUILD_FAILED {
 				return errors.NewDaytonaError("Sandbox failed to start", 0, nil)
 			}
+
+			if time.Since(startTime) > 5*time.Second {
+				interval = time.Duration(float64(interval) * 1.1)
+				if interval > time.Second {
+					interval = time.Second
+				}
+			}
+			timer.Reset(interval)
 		}
 	}
 }
@@ -447,14 +462,16 @@ func (s *Sandbox) doWaitForStop(ctx context.Context, timeout time.Duration) erro
 		defer cancel()
 	}
 
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	interval := 100 * time.Millisecond
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	startTime := time.Now()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return errors.NewDaytonaTimeoutError(fmt.Sprintf("Sandbox did not stop within %s", timeout))
-		case <-ticker.C:
+		case <-timer.C:
 			if err := s.RefreshData(ctx); err != nil {
 				return err
 			}
@@ -462,6 +479,14 @@ func (s *Sandbox) doWaitForStop(ctx context.Context, timeout time.Duration) erro
 			if s.State == apiclient.SANDBOXSTATE_STOPPED {
 				return nil
 			}
+
+			if time.Since(startTime) > 5*time.Second {
+				interval = time.Duration(float64(interval) * 1.1)
+				if interval > time.Second {
+					interval = time.Second
+				}
+			}
+			timer.Reset(interval)
 		}
 	}
 }
@@ -530,6 +555,64 @@ func (s *Sandbox) GetPreviewLink(ctx context.Context, port int) (*types.PreviewL
 			URL:   result.GetUrl(),
 			Token: result.GetToken(),
 		}, nil
+	})
+}
+
+// GetSignedPreviewLink retrieves a signed preview URL for the sandbox at the
+// specified port, valid for up to expiresInSeconds seconds.
+//
+// Example:
+//
+//	preview, err := sandbox.GetSignedPreviewLink(ctx, 3000, 3600)
+//	if err != nil {
+//	    return err
+//	}
+//	fmt.Printf("Sandbox ID: %s\nPort: %d\nURL: %s\nToken: %s\n", preview.SandboxID, preview.Port, preview.URL, preview.Token)
+func (s *Sandbox) GetSignedPreviewLink(ctx context.Context, port int, expiresInSeconds int) (*types.SignedPreviewLink, error) {
+	return withInstrumentation(ctx, s.otel, "Sandbox", "GetSignedPreviewLink", func(ctx context.Context) (*types.SignedPreviewLink, error) {
+		result, httpResp, err := s.client.apiClient.SandboxAPI.GetSignedPortPreviewUrl(
+			s.client.getAuthContext(ctx),
+			s.ID,
+			int32(port),
+		).ExpiresInSeconds(int32(expiresInSeconds)).Execute()
+
+		if err != nil {
+			return nil, s.client.handleAPIError(err, httpResp)
+		}
+
+		return &types.SignedPreviewLink{
+			SandboxID: result.GetSandboxId(),
+			Port:      int(result.GetPort()),
+			Token:     result.GetToken(),
+			URL:       result.GetUrl(),
+		}, nil
+	})
+}
+
+// ExpireSignedPreviewLink expires a previously generated signed preview link.
+//
+// This invalidates the signed preview link token, preventing any further access.
+//
+// Example:
+//
+//	err := sandbox.ExpireSignedPreviewLink(ctx, 3000, "preview-token-to-expire")
+//	if err != nil {
+//	    return err
+//	}
+func (s *Sandbox) ExpireSignedPreviewLink(ctx context.Context, port int, token string) error {
+	return withInstrumentationVoid(ctx, s.otel, "Sandbox", "ExpireSignedPreviewLink", func(ctx context.Context) error {
+		httpResp, err := s.client.apiClient.SandboxAPI.ExpireSignedPortPreviewUrl(
+			s.client.getAuthContext(ctx),
+			s.ID,
+			int32(port),
+			token,
+		).Execute()
+
+		if err != nil {
+			return s.client.handleAPIError(err, httpResp)
+		}
+
+		return nil
 	})
 }
 
@@ -728,14 +811,16 @@ func (s *Sandbox) WaitForResize(ctx context.Context, timeout time.Duration) erro
 			defer cancel()
 		}
 
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
+		interval := 100 * time.Millisecond
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		startTime := time.Now()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return errors.NewDaytonaTimeoutError(fmt.Sprintf("Sandbox resize did not complete within %s", timeout))
-			case <-ticker.C:
+			case <-timer.C:
 				if err := s.RefreshData(ctx); err != nil {
 					return err
 				}
@@ -746,6 +831,14 @@ func (s *Sandbox) WaitForResize(ctx context.Context, timeout time.Duration) erro
 				if s.State != apiclient.SANDBOXSTATE_RESIZING {
 					return nil
 				}
+
+				if time.Since(startTime) > 5*time.Second {
+					interval = time.Duration(float64(interval) * 1.1)
+					if interval > time.Second {
+						interval = time.Second
+					}
+				}
+				timer.Reset(interval)
 			}
 		}
 	})

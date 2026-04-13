@@ -32,7 +32,7 @@ import {
   ToolboxApi,
   UpdateNetworkSettingsDTO,
   RecoverSandboxDTO,
-} from '@daytonaio/runner-api-client'
+} from '@daytona/runner-api-client'
 import { Sandbox } from '../entities/sandbox.entity'
 import { BuildInfo } from '../entities/build-info.entity'
 import { DockerRegistry } from '../../docker-registry/entities/docker-registry.entity'
@@ -187,6 +187,7 @@ export class RunnerAdapterV0 implements RunnerAdapter {
 
   async createSandbox(
     sandbox: Sandbox,
+    snapshotRef: string,
     registry?: DockerRegistry,
     entrypoint?: string[],
     metadata?: { [key: string]: string },
@@ -196,7 +197,7 @@ export class RunnerAdapterV0 implements RunnerAdapter {
     const createSandboxDto: CreateSandboxDTO = {
       id: sandbox.id,
       userId: sandbox.organizationId,
-      snapshot: sandbox.snapshot,
+      snapshot: snapshotRef,
       osUser: sandbox.osUser,
       cpuQuota: sandbox.cpu,
       gpuQuota: sandbox.gpu,
@@ -254,8 +255,8 @@ export class RunnerAdapterV0 implements RunnerAdapter {
     }
   }
 
-  async stopSandbox(sandboxId: string): Promise<void> {
-    await this.sandboxApiClient.stop(sandboxId)
+  async stopSandbox(sandboxId: string, force?: boolean): Promise<void> {
+    await this.sandboxApiClient.stop(sandboxId, { force })
   }
 
   async destroySandbox(sandboxId: string): Promise<void> {

@@ -33,7 +33,7 @@ module Daytona
       @config = config
       ensure_access_token_defined
 
-      otel_enabled = config._experimental&.dig('otel_enabled') || ENV['DAYTONA_EXPERIMENTAL_OTEL_ENABLED'] == 'true'
+      otel_enabled = config._experimental&.dig('otel_enabled') || config.read_env('DAYTONA_EXPERIMENTAL_OTEL_ENABLED') == 'true'
       @otel_state = (::Daytona.init_otel(Sdk::VERSION) if otel_enabled)
 
       @api_client = build_api_client
@@ -228,6 +228,7 @@ module Daytona
         client.default_headers[HEADER_SOURCE] = SOURCE_RUBY
         client.default_headers[HEADER_SDK_VERSION] = Sdk::VERSION
         client.default_headers[HEADER_ORGANIZATION_ID] = config.organization_id if config.jwt_token
+        client.user_agent = "sdk-ruby/#{Sdk::VERSION}"
       end
     end
 
@@ -281,7 +282,7 @@ module Daytona
     # @return [Daytona::CodeToolbox]
     def code_toolbox_from_labels(labels) = code_toolbox_from_language(labels[LABEL_CODE_TOOLBOX_LANGUAGE]&.to_sym)
 
-    SOURCE_RUBY = 'ruby-sdk'
+    SOURCE_RUBY = 'sdk-ruby'
     private_constant :SOURCE_RUBY
 
     HEADER_SOURCE = 'X-Daytona-Source'

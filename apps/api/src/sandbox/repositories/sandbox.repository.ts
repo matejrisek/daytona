@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
-import { DataSource, FindOptionsWhere } from 'typeorm'
+import { DataSource, EntityManager, FindOptionsWhere } from 'typeorm'
 import { Sandbox } from '../entities/sandbox.entity'
-import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common'
+import { SandboxLastActivity } from '../entities/sandbox-last-activity.entity'
+import { Injectable, Logger, NotFoundException } from '@nestjs/common'
+import { SandboxConflictError } from '../errors/sandbox-conflict.error'
 import { InjectDataSource } from '@nestjs/typeorm'
 import { EventEmitter2 } from '@nestjs/event-emitter'
 import { BaseRepository } from '../../common/repositories/base.repository'
@@ -36,14 +38,14 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
     if (!sandbox.updatedAt) {
       sandbox.updatedAt = now
     }
-    if (!sandbox.lastActivityAt) {
-      sandbox.lastActivityAt = now
-    }
 
     sandbox.assertValid()
     sandbox.enforceInvariants()
 
-    await this.repository.insert(sandbox)
+    await this.dataSource.transaction(async (entityManager) => {
+      await entityManager.insert(Sandbox, sandbox)
+      await this.upsertLastActivity(entityManager, sandbox.id, sandbox.createdAt)
+    })
 
     this.invalidateLookupCacheOnInsert(sandbox)
 
@@ -72,10 +74,6 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
   ): Promise<Sandbox | void> {
     const { updateData, entity } = params
 
-    if (updateData.state && !updateData.lastActivityAt) {
-      updateData.lastActivityAt = new Date()
-    }
-
     if (raw) {
       await this.repository.update(id, updateData)
       return
@@ -92,20 +90,27 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
     sandbox.assertValid()
     const invariantChanges = sandbox.enforceInvariants()
 
-    const result = await this.repository.update(
-      {
-        id: previousSandbox.id,
-        state: previousSandbox.state,
-        desiredState: previousSandbox.desiredState,
-        pending: previousSandbox.pending,
-        organizationId: previousSandbox.organizationId,
-      },
-      { ...updateData, ...invariantChanges },
-    )
-    if (!result.affected) {
-      throw new ConflictException('Sandbox was modified by another operation, please try again')
-    }
-    sandbox.updatedAt = new Date()
+    await this.dataSource.transaction(async (entityManager) => {
+      const result = await entityManager.update(
+        Sandbox,
+        {
+          id: previousSandbox.id,
+          state: previousSandbox.state,
+          desiredState: previousSandbox.desiredState,
+          pending: previousSandbox.pending,
+          organizationId: previousSandbox.organizationId,
+        },
+        { ...updateData, ...invariantChanges },
+      )
+      if (!result.affected) {
+        throw new SandboxConflictError()
+      }
+      sandbox.updatedAt = new Date()
+
+      if (previousSandbox.state !== sandbox.state || previousSandbox.organizationId !== sandbox.organizationId) {
+        await this.upsertLastActivity(entityManager, id, sandbox.updatedAt)
+      }
+    })
 
     this.emitUpdateEvents(sandbox, previousSandbox)
     this.invalidateLookupCacheOnUpdate(sandbox, previousSandbox)
@@ -122,7 +127,7 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
    * @param params.updateData - The partial data to update.
    * @param params.whereCondition - The where condition to use for the update.
    *
-   * @throws {ConflictException} if the sandbox was modified by another operation
+   * @throws {SandboxConflictError} if the sandbox was modified by another operation
    */
   async updateWhere(
     id: string,
@@ -132,10 +137,6 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
     },
   ): Promise<Sandbox> {
     const { updateData, whereCondition } = params
-
-    if (updateData.state && !updateData.lastActivityAt) {
-      updateData.lastActivityAt = new Date()
-    }
 
     return this.manager.transaction(async (entityManager) => {
       const whereClause = {
@@ -151,7 +152,7 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
       })
 
       if (!sandbox) {
-        throw new ConflictException('Sandbox was modified by another operation, please try again.')
+        throw new SandboxConflictError()
       }
 
       const previousSandbox = { ...sandbox }
@@ -163,11 +164,26 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
       await entityManager.update(Sandbox, id, { ...updateData, ...invariantChanges })
       sandbox.updatedAt = new Date()
 
+      if (previousSandbox.state !== sandbox.state || previousSandbox.organizationId !== sandbox.organizationId) {
+        await this.upsertLastActivity(entityManager, id, sandbox.updatedAt)
+      }
+
       this.emitUpdateEvents(sandbox, previousSandbox)
       this.invalidateLookupCacheOnUpdate(sandbox, previousSandbox)
 
       return sandbox
     })
+  }
+
+  /**
+   * Upserts the last activity for a sandbox.
+   */
+  private async upsertLastActivity(
+    entityManager: EntityManager,
+    sandboxId: string,
+    lastActivityAt: Date,
+  ): Promise<void> {
+    await entityManager.upsert(SandboxLastActivity, { sandboxId, lastActivityAt }, ['sandboxId'])
   }
 
   /**

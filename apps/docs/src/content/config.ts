@@ -12,6 +12,8 @@ export const collections = {
         licence: z.string().optional(),
         distribution: z.string().optional(),
         hideTitleOnPage: z.boolean().optional(),
+        llmUrl: z.string().optional(),
+        toolboxLlmUrl: z.string().optional(),
       }),
     }),
   }),
@@ -31,6 +33,7 @@ export enum NavigationCategory {
   GUIDES,
   RUBY_SDK,
   GO_SDK,
+  JAVA_SDK,
 }
 
 /**
@@ -99,6 +102,15 @@ export const getSidebarConfig = (
             icon: 'package.svg',
           },
           relatedGroupCategory: NavigationCategory.GO_SDK,
+        },
+        {
+          type: 'link',
+          href: localizePath('/docs/java-sdk', locale),
+          label: t('sidebarconfig.javaSdkReference'),
+          attrs: {
+            icon: 'package.svg',
+          },
+          relatedGroupCategory: NavigationCategory.JAVA_SDK,
         },
         {
           type: 'link',
@@ -447,10 +459,7 @@ export const getSidebarConfig = (
         },
         {
           type: 'link',
-          href: localizePath(
-            '/docs/guides/opencode/opencode-plugin',
-            locale
-          ),
+          href: localizePath('/docs/guides/opencode/opencode-plugin', locale),
           label: t('sidebarconfig.opencode'),
           disablePagination: true,
           hideInSidebar: true,
@@ -588,10 +597,7 @@ export const getSidebarConfig = (
         },
         {
           type: 'link',
-          href: localizePath(
-            '/docs/guides/amp/amp-sdk-coding-agent',
-            locale
-          ),
+          href: localizePath('/docs/guides/amp/amp-sdk-coding-agent', locale),
           label: t('sidebarconfig.amp'),
           disablePagination: true,
           attrs: {
@@ -600,7 +606,10 @@ export const getSidebarConfig = (
         },
         {
           type: 'link',
-          href: localizePath('/docs/guides/google-adk-code-generator', locale),
+          href: localizePath(
+            '/docs/guides/google-adk/google-adk-code-generator',
+            locale
+          ),
           label: t('sidebarconfig.googleAdk'),
           disablePagination: true,
           attrs: {
@@ -621,11 +630,11 @@ export const getSidebarConfig = (
         },
         {
           type: 'link',
-          href: localizePath('/docs/guides/reinforcement-learning', locale),
-          label: t('sidebarconfig.reinforcementLearning'),
+          href: localizePath('/docs/guides/ag2/ag2-bug-fixer-agent', locale),
+          label: t('sidebarconfig.ag2'),
           disablePagination: true,
           attrs: {
-            icon: 'nabla.svg',
+            icon: 'ag2.svg',
           },
         },
         {
@@ -634,9 +643,11 @@ export const getSidebarConfig = (
             '/docs/guides/reinforcement-learning/trl-grpo-training',
             locale
           ),
-          label: t('sidebarconfig.trlGrpo'),
+          label: t('sidebarconfig.trl'),
           disablePagination: true,
-          hideInSidebar: true,
+          attrs: {
+            icon: 'trl.svg',
+          },
         },
         {
           type: 'link',
@@ -644,9 +655,11 @@ export const getSidebarConfig = (
             '/docs/guides/reinforcement-learning/openenv-finqa',
             locale
           ),
-          label: t('sidebarconfig.openenvFinqa'),
+          label: t('sidebarconfig.openenv'),
           disablePagination: true,
-          hideInSidebar: true,
+          attrs: {
+            icon: 'openenv.svg',
+          },
         },
         {
           type: 'link',
@@ -907,6 +920,25 @@ export const getSidebarConfig = (
           type: 'link',
           href: localizePath('/docs/go-sdk/daytona', locale),
           label: t('sidebarconfig.daytona'),
+        },
+      ],
+    },
+    {
+      type: 'group',
+      label: t('sidebarconfig.javaSdkReference'),
+      homePageHref: localizePath('/docs/java-sdk', locale),
+      category: NavigationCategory.JAVA_SDK,
+      autopopulateFromDir: localizePath('/docs/java-sdk', locale),
+      entries: [
+        {
+          type: 'link',
+          href: localizePath('/docs/java-sdk/daytona', locale),
+          label: t('sidebarconfig.daytona'),
+        },
+        {
+          type: 'link',
+          href: localizePath('/docs/java-sdk/sandbox', locale),
+          label: t('sidebarconfig.sandbox'),
         },
       ],
     },

@@ -29,6 +29,7 @@ import { LockCode, RedisLockProvider } from '../../common/redis-lock.provider'
 import { InjectRedis } from '@nestjs-modules/ioredis'
 import Redis from 'ioredis'
 import { WithSpan } from '../../../common/decorators/otel.decorator'
+import { SandboxActivityService } from '../../services/sandbox-activity.service'
 
 @Injectable()
 export class SandboxStartAction extends SandboxAction {
@@ -43,6 +44,7 @@ export class SandboxStartAction extends SandboxAction {
     protected readonly configService: TypedConfigService,
     protected readonly redisLockProvider: RedisLockProvider,
     @InjectRedis() private readonly redis: Redis,
+    private readonly sandboxActivityService: SandboxActivityService,
   ) {
     super(runnerService, runnerAdapterFactory, sandboxRepository, redisLockProvider)
   }
@@ -363,20 +365,20 @@ export class SandboxStartAction extends SandboxAction {
 
     let internalRegistry: DockerRegistry
     let entrypoint: string[]
+    let snapshotRef: string
     if (!sandbox.buildInfo) {
       //  get internal snapshot name
       const snapshot = await this.snapshotService.getSnapshotByName(sandbox.snapshot, sandbox.organizationId)
-      const snapshotRef = snapshot.ref
+      snapshotRef = snapshot.ref
 
       internalRegistry = await this.dockerRegistryService.findInternalRegistryBySnapshotRef(snapshotRef, runner.region)
       if (!internalRegistry) {
         throw new Error('No registry found for snapshot')
       }
 
-      sandbox.snapshot = snapshotRef
       entrypoint = snapshot.entrypoint
     } else {
-      sandbox.snapshot = sandbox.buildInfo.snapshotRef
+      snapshotRef = sandbox.buildInfo.snapshotRef
       entrypoint = this.snapshotService.getEntrypointFromDockerfile(sandbox.buildInfo.dockerfileContent)
     }
 
@@ -387,6 +389,7 @@ export class SandboxStartAction extends SandboxAction {
 
     const result = await runnerAdapter.createSandbox(
       sandbox,
+      snapshotRef,
       internalRegistry,
       entrypoint,
       metadata,
@@ -649,10 +652,8 @@ export class SandboxStartAction extends SandboxAction {
   }
 
   private async checkTimeoutError(sandbox: Sandbox, timeoutMinutes: number, errorReason: string): Promise<boolean> {
-    if (
-      sandbox.lastActivityAt &&
-      new Date(sandbox.lastActivityAt).getTime() < Date.now() - 1000 * 60 * timeoutMinutes
-    ) {
+    const lastActivityAt = await this.sandboxActivityService.getLastActivityAt(sandbox.id)
+    if (lastActivityAt && lastActivityAt.getTime() < Date.now() - 1000 * 60 * timeoutMinutes) {
       const updateData: Partial<Sandbox> = {
         state: SandboxState.ERROR,
         errorReason,
@@ -823,8 +824,6 @@ export class SandboxStartAction extends SandboxAction {
 
     await this.updateSandboxState(sandbox, SandboxState.RESTORING, lockCode, runner.id)
 
-    sandbox.snapshot = validBackup
-
     const metadata = {
       ...organization?.sandboxMetadata,
       sandboxName: sandbox.name,
@@ -832,6 +831,7 @@ export class SandboxStartAction extends SandboxAction {
 
     await runnerAdapter.createSandbox(
       sandbox,
+      validBackup,
       registry,
       undefined,
       metadata,

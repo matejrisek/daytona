@@ -19,7 +19,7 @@ import { OrganizationUserService } from './services/organization-user.service'
 import { OrganizationInvitationService } from './services/organization-invitation.service'
 import { UserModule } from '../user/user.module'
 import { Sandbox } from '../sandbox/entities/sandbox.entity'
-import { Snapshot } from '../sandbox/entities/snapshot.entity'
+import { SnapshotRepository } from '../sandbox/repositories/snapshot.repository'
 import { Volume } from '../sandbox/entities/volume.entity'
 import { RedisLockProvider } from '../sandbox/common/redis-lock.provider'
 import { SnapshotRunner } from '../sandbox/entities/snapshot-runner.entity'
@@ -28,6 +28,7 @@ import { DataSource } from 'typeorm'
 import { EventEmitter2 } from '@nestjs/event-emitter'
 import { SandboxRepository } from '../sandbox/repositories/sandbox.repository'
 import { SandboxLookupCacheInvalidationService } from '../sandbox/services/sandbox-lookup-cache-invalidation.service'
+import { OrganizationAuthContextGuard } from './guards/organization-auth-context.guard'
 import { RegionQuota } from './entities/region-quota.entity'
 import { RegionModule } from '../region/region.module'
 import { OrganizationRegionController } from './controllers/organization-region.controller'
@@ -44,7 +45,6 @@ import { EncryptionModule } from '../encryption/encryption.module'
       OrganizationUser,
       OrganizationInvitation,
       Sandbox,
-      Snapshot,
       Volume,
       SnapshotRunner,
       RegionQuota,
@@ -76,6 +76,13 @@ import { EncryptionModule } from '../encryption/encryption.module'
         sandboxLookupCacheInvalidationService: SandboxLookupCacheInvalidationService,
       ) => new SandboxRepository(dataSource, eventEmitter, sandboxLookupCacheInvalidationService),
     },
+    {
+      provide: SnapshotRepository,
+      inject: [DataSource, EventEmitter2],
+      useFactory: (dataSource: DataSource, eventEmitter: EventEmitter2) =>
+        new SnapshotRepository(dataSource, eventEmitter),
+    },
+    OrganizationAuthContextGuard,
   ],
   exports: [
     OrganizationService,
@@ -83,6 +90,7 @@ import { EncryptionModule } from '../encryption/encryption.module'
     OrganizationUserService,
     OrganizationInvitationService,
     OrganizationUsageService,
+    OrganizationAuthContextGuard,
   ],
 })
 export class OrganizationModule {}

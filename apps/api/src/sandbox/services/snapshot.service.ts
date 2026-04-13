@@ -12,13 +12,15 @@ import {
   Logger,
 } from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
-import { Repository, Not, In, Raw, ILike, FindOptionsWhere } from 'typeorm'
+import { Repository, Not, In, Raw, ILike, IsNull, FindOptionsWhere, Like, LessThan } from 'typeorm'
+import { SnapshotRepository } from '../repositories/snapshot.repository'
 import { v4 as uuidv4, validate as isUUID } from 'uuid'
 import { Snapshot } from '../entities/snapshot.entity'
 import { SnapshotState } from '../enums/snapshot-state.enum'
 import { CreateSnapshotDto } from '../dto/create-snapshot.dto'
 import { BuildInfo } from '../entities/build-info.entity'
 import { generateBuildInfoHash as generateBuildSnapshotRef } from '../entities/build-info.entity'
+import { Cron, CronExpression } from '@nestjs/schedule'
 import { EventEmitter2, OnEvent } from '@nestjs/event-emitter'
 import { SandboxEvents } from '../constants/sandbox-events.constants'
 import { SandboxCreatedEvent } from '../events/sandbox-create.event'
@@ -50,6 +52,8 @@ import { RegionService } from '../../region/services/region.service'
 import { TypedConfigService } from '../../config/typed-config.service'
 import { SandboxRepository } from '../repositories/sandbox.repository'
 import { SnapshotActivatedEvent } from '../events/snapshot-activated.event'
+import { LogExecution } from '../../common/decorators/log-execution.decorator'
+import { WithInstrumentation } from '../../common/decorators/otel.decorator'
 
 const IMAGE_NAME_REGEX = /^[a-zA-Z0-9_.\-:]+(\/[a-zA-Z0-9_.\-:]+)*(@sha256:[a-f0-9]{64})?$/
 @Injectable()
@@ -58,8 +62,7 @@ export class SnapshotService {
 
   constructor(
     private readonly sandboxRepository: SandboxRepository,
-    @InjectRepository(Snapshot)
-    private readonly snapshotRepository: Repository<Snapshot>,
+    private readonly snapshotRepository: SnapshotRepository,
     @InjectRepository(BuildInfo)
     private readonly buildInfoRepository: Repository<BuildInfo>,
     @InjectRepository(SnapshotRunner)
@@ -126,7 +129,7 @@ export class SnapshotService {
   private async readySnapshotRunnerExists(ref: string, regionId: string): Promise<boolean> {
     return await this.snapshotRunnerRepository
       .createQueryBuilder('sr')
-      .innerJoin('runner', 'r', 'r.id::text = sr."runnerId"::text')
+      .innerJoin('runner', 'r', 'r.id = sr."runnerId"::uuid')
       .where('sr."snapshotRef" = :ref', { ref })
       .andWhere('sr.state = :snapshotRunnerState', { snapshotRunnerState: SnapshotRunnerState.READY })
       .andWhere('r.region = :regionId', { regionId })
@@ -194,11 +197,11 @@ export class SnapshotService {
           snapshotRegions: [{ snapshotId, regionId }],
         })
 
-        const savedSnapshot = await this.snapshotRepository.save(snapshot)
+        const insertedSnapshot = await this.snapshotRepository.insert(snapshot)
 
-        this.eventEmitter.emit(SnapshotEvents.CREATED, new SnapshotCreatedEvent(savedSnapshot))
+        this.eventEmitter.emit(SnapshotEvents.CREATED, new SnapshotCreatedEvent(insertedSnapshot))
 
-        return savedSnapshot
+        return insertedSnapshot
       } catch (error) {
         if (error.code === '23505') {
           // PostgreSQL unique violation error code
@@ -295,16 +298,29 @@ export class SnapshotService {
       const exists = await this.readySnapshotRunnerExists(snapshot.ref, regionId)
 
       if (exists) {
-        snapshot.state = SnapshotState.ACTIVE
-        snapshot.lastUsedAt = new Date()
+        const existingSnapshot = await this.snapshotRepository.findOne({
+          where: { ref: snapshot.ref, size: Not(IsNull()) },
+          select: ['id', 'size'],
+        })
+
+        if (existingSnapshot?.size != null) {
+          if (existingSnapshot.size > organization.maxSnapshotSize) {
+            throw new BadRequestException(
+              `Snapshot size (${existingSnapshot.size.toFixed(2)}GB) exceeds maximum allowed size of ${organization.maxSnapshotSize}GB`,
+            )
+          }
+          snapshot.size = existingSnapshot.size
+          snapshot.state = SnapshotState.ACTIVE
+          snapshot.lastUsedAt = new Date()
+        }
       }
 
       try {
-        const savedSnapshot = await this.snapshotRepository.save(snapshot)
+        const insertedSnapshot = await this.snapshotRepository.insert(snapshot)
 
-        this.eventEmitter.emit(SnapshotEvents.CREATED, new SnapshotCreatedEvent(savedSnapshot))
+        this.eventEmitter.emit(SnapshotEvents.CREATED, new SnapshotCreatedEvent(insertedSnapshot))
 
-        return savedSnapshot
+        return insertedSnapshot
       } catch (error) {
         if (error.code === '23505') {
           // PostgreSQL unique violation error code
@@ -331,8 +347,12 @@ export class SnapshotService {
     if (snapshot.general) {
       throw new ForbiddenException('You cannot delete a general snapshot')
     }
-    snapshot.state = SnapshotState.REMOVING
-    await this.snapshotRepository.save(snapshot)
+
+    const updateData: Partial<Snapshot> = {
+      state: SnapshotState.REMOVING,
+    }
+
+    await this.snapshotRepository.update(snapshotId, { updateData, entity: snapshot })
   }
 
   async getAllSnapshots(
@@ -467,8 +487,11 @@ export class SnapshotService {
       throw new NotFoundException(`Snapshot ${snapshotId} not found`)
     }
 
-    snapshot.general = general
-    return await this.snapshotRepository.save(snapshot)
+    const updateData: Partial<Snapshot> = {
+      general,
+    }
+
+    return await this.snapshotRepository.update(snapshotId, { updateData, entity: snapshot })
   }
 
   async getBuildLogsUrl(snapshot: Snapshot): Promise<string> {
@@ -559,8 +582,12 @@ export class SnapshotService {
     }
 
     const snapshot = await this.getSnapshotByName(event.sandbox.snapshot, event.sandbox.organizationId)
-    snapshot.lastUsedAt = event.sandbox.createdAt
-    await this.snapshotRepository.save(snapshot)
+
+    const updateData: Partial<Snapshot> = {
+      lastUsedAt: event.sandbox.createdAt,
+    }
+
+    await this.snapshotRepository.update(snapshot.id, { updateData }, true)
   }
 
   async activateSnapshot(snapshotId: string, organization: Organization): Promise<Snapshot> {
@@ -602,12 +629,18 @@ export class SnapshotService {
         pendingSnapshotCountIncrement = activatedSnapshotCount
       }
 
-      snapshot.state = SnapshotState.PENDING
-      const savedSnapshot = await this.snapshotRepository.save(snapshot)
+      const updateData: Partial<Snapshot> = {
+        state: SnapshotState.PENDING,
+      }
 
-      this.eventEmitter.emit(SnapshotEvents.ACTIVATED, new SnapshotActivatedEvent(savedSnapshot))
+      const updatedSnapshot = await this.snapshotRepository.update(snapshotId, {
+        updateData,
+        entity: snapshot,
+      })
 
-      return savedSnapshot
+      this.eventEmitter.emit(SnapshotEvents.ACTIVATED, new SnapshotActivatedEvent(updatedSnapshot))
+
+      return updatedSnapshot
     } catch (error) {
       await this.rollbackPendingUsage(organization.id, pendingSnapshotCountIncrement)
       throw error
@@ -662,8 +695,11 @@ export class SnapshotService {
       return
     }
 
-    snapshot.state = SnapshotState.INACTIVE
-    await this.snapshotRepository.save(snapshot)
+    const updateData: Partial<Snapshot> = {
+      state: SnapshotState.INACTIVE,
+    }
+
+    await this.snapshotRepository.update(snapshotId, { updateData, entity: snapshot })
 
     try {
       const countActiveSnapshots = await this.snapshotRepository.count({
@@ -691,7 +727,8 @@ export class SnapshotService {
   // TODO: revise/cleanup
   getEntrypointFromDockerfile(dockerfileContent: string): string[] {
     // Match ENTRYPOINT with either a string or JSON array
-    const entrypointMatch = dockerfileContent.match(/ENTRYPOINT\s+(.*)/)
+    const matches = [...dockerfileContent.matchAll(/ENTRYPOINT\s+(.*)/g)]
+    const entrypointMatch = matches.length ? matches[matches.length - 1] : null
     if (entrypointMatch) {
       const rawEntrypoint = entrypointMatch[1].trim()
       try {
@@ -791,5 +828,50 @@ export class SnapshotService {
       { runnerId: payload.runnerId },
       { state: SnapshotRunnerState.REMOVING },
     )
+  }
+
+  @Cron(CronExpression.EVERY_MINUTE, { name: 'cleanup-failed-snapshot-runners' })
+  @LogExecution('cleanup-failed-snapshot-runners')
+  @WithInstrumentation()
+  async cleanupFailedSnapshotRunners() {
+    const retentionHours = this.configService.getOrThrow('failedSnapshotRunnerRetentionHours')
+    const cutoff = new Date()
+    cutoff.setHours(cutoff.getHours() - retentionHours)
+
+    const result = await this.snapshotRunnerRepository.delete({
+      snapshotRef: Like('daytona-%'),
+      state: SnapshotRunnerState.ERROR,
+      updatedAt: LessThan(cutoff),
+    })
+
+    if (result.affected > 0) {
+      this.logger.debug(`Cleaned up ${result.affected} failed snapshot runners`)
+    }
+  }
+
+  @Cron(CronExpression.EVERY_MINUTE, { name: 'cleanup-decommissioned-snapshot-runners' })
+  @LogExecution('cleanup-decommissioned-snapshot-runners')
+  @WithInstrumentation()
+  async cleanupDecommissionedSnapshotRunners() {
+    const cutoff = new Date()
+    cutoff.setHours(cutoff.getHours() - 1)
+
+    const snapshotRunners = await this.snapshotRunnerRepository
+      .createQueryBuilder('sr')
+      .innerJoin('runner', 'r', 'r.id = sr."runnerId"::uuid')
+      .where('r.state = :runnerState', { runnerState: RunnerState.DECOMMISSIONED })
+      .andWhere('sr."updatedAt" < :cutoff', { cutoff })
+      .select('sr.id')
+      .take(500)
+      .getMany()
+
+    if (snapshotRunners.length === 0) {
+      return
+    }
+
+    const ids = snapshotRunners.map((sr) => sr.id)
+    await this.snapshotRunnerRepository.delete(ids)
+
+    this.logger.debug(`Cleaned up ${ids.length} snapshot runners from decommissioned runners`)
   }
 }

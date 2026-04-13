@@ -26,6 +26,8 @@ export const queryKeys = {
 
     list: () => [...queryKeys.organization.all, 'list'] as const,
     detail: (organizationId: string) => [...queryKeys.organization.all, organizationId, 'detail'] as const,
+    roles: (organizationId: string) => [...queryKeys.organization.all, organizationId, 'roles'] as const,
+    invitations: (organizationId: string) => [...queryKeys.organization.all, organizationId, 'invitations'] as const,
 
     usage: {
       overview: (organizationId: string) =>
@@ -70,6 +72,14 @@ export const queryKeys = {
         },
       ] as const
     },
+  },
+  registries: {
+    all: ['registries'] as const,
+    list: (organizationId: string) => [...queryKeys.registries.all, organizationId, 'list'] as const,
+  },
+  volumes: {
+    all: ['volumes'] as const,
+    list: (organizationId: string) => [...queryKeys.volumes.all, organizationId, 'list'] as const,
   },
   audit: {
     all: ['audit'] as const,

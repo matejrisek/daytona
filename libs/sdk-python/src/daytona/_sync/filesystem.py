@@ -9,6 +9,8 @@ from contextlib import ExitStack
 from typing import overload
 
 import httpx
+from python_multipart.multipart import MultipartParser, parse_options_header
+
 from daytona_toolbox_api_client import (
     FileInfo,
     FilesDownloadRequest,
@@ -18,12 +20,18 @@ from daytona_toolbox_api_client import (
     ReplaceResult,
     SearchFilesResponse,
 )
-from python_multipart.multipart import MultipartParser, parse_options_header
 
 from .._utils.errors import intercept_errors
 from .._utils.otel_decorator import with_instrumentation
 from ..common.errors import DaytonaError
-from ..common.filesystem import FileDownloadRequest, FileDownloadResponse, FileUpload
+from ..common.filesystem import (
+    FileDownloadErrorDetails,
+    FileDownloadRequest,
+    FileDownloadResponse,
+    FileUpload,
+    create_file_download_error,
+    parse_file_download_error_payload,
+)
 
 
 class FileSystem:
@@ -141,7 +149,7 @@ class FileSystem:
             timeout = int(args[1]) if len(args) == 2 else 30 * 60
             response = (self.download_files([FileDownloadRequest(source=remote_path)], timeout=timeout))[0]
             if response.error:
-                raise DaytonaError(response.error)
+                raise create_file_download_error(response)
             result = response.result
             if isinstance(result, str):
                 result = result.encode("utf-8")
@@ -154,7 +162,7 @@ class FileSystem:
             self.download_files([FileDownloadRequest(source=remote_path, destination=local_path)], timeout=timeout)
         )[0]
         if response.error:
-            raise DaytonaError(response.error)
+            raise create_file_download_error(response)
         return None
 
     @intercept_errors(message_prefix="Failed to download files: ")
@@ -171,7 +179,8 @@ class FileSystem:
 
         Raises:
             Exception: Only if the request itself fails (network issues, invalid request/response, etc.). Individual
-            file download errors are returned in the `FileDownloadResponse.error` field.
+            file download errors are returned in `FileDownloadResponse.error`. When the daemon provides structured
+            per-file metadata, it is also available in `FileDownloadResponse.error_details`.
 
         Example:
             ```python
@@ -194,6 +203,7 @@ class FileSystem:
             def __init__(self, dst: str | None):
                 self.dst: str | None = dst
                 self.error: str | None = None
+                self.error_details: FileDownloadErrorDetails | None = None
                 self.result: str | bytes | io.BytesIO | None = None
 
         src_file_meta_dict: dict[str, FileMeta] = {}
@@ -226,6 +236,7 @@ class FileSystem:
 
                     writer: io.BytesIO | io.BufferedIOBase | None = None
                     mode: str | None = None
+                    part_content_type: str | None = None
                     source: str | None = None
                     header_field = bytearray()
                     header_value = bytearray()
@@ -233,11 +244,12 @@ class FileSystem:
                     error_buffer = bytearray()
 
                     def on_part_begin() -> None:
-                        nonlocal writer, mode, source
+                        nonlocal writer, mode, part_content_type, source
                         part_headers.clear()
                         error_buffer.clear()
                         writer = None
                         mode = None
+                        part_content_type = None
                         source = None
 
                     def on_header_field(data: bytes, start: int, end: int) -> None:
@@ -254,13 +266,14 @@ class FileSystem:
                         header_value.clear()
 
                     def on_headers_finished() -> None:
-                        nonlocal writer, mode, source
+                        nonlocal writer, mode, part_content_type, source
                         cd = part_headers.get("content-disposition", "")
                         _, cd_params = parse_options_header(cd)
                         name = cd_params.get(b"name", b"").decode("utf-8", errors="ignore")
                         source = cd_params.get(b"filename", b"").decode("utf-8", errors="ignore") or None
                         if not source:
                             raise DaytonaError("No source path found for this file")
+                        part_content_type = part_headers.get("content-type")
 
                         if name == "error":
                             mode = "error"
@@ -296,11 +309,15 @@ class FileSystem:
                                 mode = None
 
                     def on_part_end() -> None:
-                        nonlocal writer, mode, source
+                        nonlocal writer, mode, part_content_type, source
                         if mode == "error" and error_buffer:
-                            error_text = bytes(error_buffer).decode("utf-8", errors="ignore").strip()
+                            error_text, error_details = parse_file_download_error_payload(
+                                bytes(error_buffer),
+                                part_content_type,
+                            )
                             if source:
                                 src_file_meta_dict[source].error = error_text
+                                src_file_meta_dict[source].error_details = error_details
                             else:
                                 raise DaytonaError(f"Error happened for unknown file with error {error_text}")
                             error_buffer.clear()
@@ -308,6 +325,7 @@ class FileSystem:
                             writer.close()
                         writer = None
                         mode = None
+                        part_content_type = None
                         source = None
 
                     parser = MultipartParser(
@@ -349,6 +367,7 @@ class FileSystem:
                     source=f.source,
                     result=res,
                     error=err,
+                    error_details=meta.error_details,
                 )
             )
 
@@ -713,4 +732,13 @@ class FileSystem:
                 response = client.post(
                     url, data=data_fields, files=file_fields, headers=headers  # any non-file form fields
                 )
-                _ = response.raise_for_status()
+
+                if not response.is_success:
+                    try:
+                        detail = ", ".join(response.json()["errors"])
+                    except Exception:
+                        detail = response.text
+                    raise DaytonaError(
+                        f"{response.status_code}: {detail}",
+                        status_code=response.status_code,
+                    )

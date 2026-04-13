@@ -30,7 +30,14 @@ find "$MODELS_DIR" -type f -name "*.py" | while read -r f; do
   sed -i'' -E '/Field\(/ s/alias="([^"]+)"/serialization_alias="\1"/g' "$f"
 done
 
+# Remove hardcoded 300s HTTP timeout fallback from async REST clients
+# so that timeout=None means no timeout, matching TypeScript SDK behavior.
+# Server-side already handles stale connections.
+sed -i 's/timeout = _request_timeout or 5 \* 60/timeout = _request_timeout/' "$pkg_root/rest.py"
+
+# Set dynamic User-Agent with package version
+CLIENT_NAME=$(basename "$PROJECT_ROOT")
+sed -i '/^from.*\.configuration import Configuration$/a from . import __version__ as _pkg_version' "$pkg_root/api_client.py"
+sed -i "s|self\.user_agent = '[^']*'|self.user_agent = f'${CLIENT_NAME}/{_pkg_version}'|" "$pkg_root/api_client.py"
+
 echo "Postprocessed Python client at $PROJECT_ROOT"
-
-
-

@@ -8,6 +8,8 @@ import json
 import re
 
 import websockets
+from websockets.sync.client import connect
+
 from daytona_toolbox_api_client import (
     Command,
     CreateSessionRequest,
@@ -19,7 +21,6 @@ from daytona_toolbox_api_client import (
     Session,
     SessionSendInputRequest,
 )
-from websockets.sync.client import connect
 
 from .._utils.errors import intercept_errors
 from .._utils.otel_decorator import with_instrumentation
@@ -138,7 +139,7 @@ class Process:
             safe_env_exports = (
                 " ".join(
                     [
-                        f"""export {key}="$(echo '{base64.b64encode(value.encode()).decode()}' | base64 -d)";"""
+                        f"""export {key}="$(printf '%s' '{base64.b64encode(value.encode()).decode()}' | base64 -d)";"""
                         for key, value in env.items()
                     ]
                 )
@@ -148,7 +149,10 @@ class Process:
 
         execute_request = ExecuteRequest(command=command, cwd=cwd, timeout=timeout)
 
-        response = self._api_client.execute_command(request=execute_request)
+        response = self._api_client.execute_command(
+            request=execute_request,
+            _request_timeout=http_timeout(timeout + 5 if timeout else None),
+        )
 
         # Post-process the output to extract ExecutionArtifacts
         artifacts = Process._parse_output(response.result.split("\n"))
@@ -374,7 +378,7 @@ class Process:
         response = self._api_client.session_execute_command(
             session_id=session_id,
             request=req,
-            _request_timeout=http_timeout(timeout),
+            _request_timeout=http_timeout(timeout + 5 if timeout else None),
         )
 
         stdout, stderr = demux_log(response.output.encode("utf-8", "ignore") if response.output else b"")

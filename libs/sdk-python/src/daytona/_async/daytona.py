@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import warnings
 from copy import deepcopy
 from importlib.metadata import version
 from types import TracebackType
 from typing import Callable, cast, overload
+
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.semconv.attributes import service_attributes
 
 from daytona_api_client_async import (
     ApiClient,
@@ -25,16 +32,9 @@ from daytona_api_client_async import (
 )
 from daytona_api_client_async import VolumesApi as VolumesApi
 from daytona_toolbox_api_client_async import ApiClient as ToolboxApiClient
-from environs import Env
-from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.semconv.attributes import service_attributes
 
 from .._utils.enum import to_enum
+from .._utils.env import DaytonaEnvReader
 from .._utils.errors import intercept_errors
 from .._utils.otel_decorator import with_instrumentation
 from .._utils.stream import process_streaming_response
@@ -49,9 +49,10 @@ from ..common.daytona import (
     CreateSandboxFromSnapshotParams,
     DaytonaConfig,
 )
-from ..common.errors import DaytonaError
+from ..common.errors import DaytonaAuthenticationError, DaytonaValidationError
 from ..common.image import Image
 from ..common.protocols import SandboxCodeToolbox
+from ..internal.pool_tracker import AsyncPoolSaturationTracker
 from .sandbox import AsyncPaginatedSandboxes, AsyncSandbox
 from .snapshot import AsyncSnapshotService
 from .volume import AsyncVolumeService
@@ -150,6 +151,8 @@ class AsyncDaytona:
             api_url = config.api_url or config.server_url
             self._target = config.target
 
+        env_reader: DaytonaEnvReader | None = None
+
         if config is None or (
             not all([self._api_key, api_url, self._target])
             and not all(
@@ -161,19 +164,14 @@ class AsyncDaytona:
                 ]
             )
         ):
-            # Initialize env - it automatically reads from .env and .env.local
-            env = Env()
-            _ = env.read_env()
-            _ = env.read_env(".env", override=True)
-            _ = env.read_env(".env.local", override=True)
+            env_reader = DaytonaEnvReader()
+            self._api_key = self._api_key or (env_reader.get("DAYTONA_API_KEY") if not self._jwt_token else None)
+            self._jwt_token = self._jwt_token or env_reader.get("DAYTONA_JWT_TOKEN")
+            self._organization_id = self._organization_id or env_reader.get("DAYTONA_ORGANIZATION_ID")
+            api_url = api_url or env_reader.get("DAYTONA_API_URL") or env_reader.get("DAYTONA_SERVER_URL")
+            self._target = self._target or env_reader.get("DAYTONA_TARGET")
 
-            self._api_key = self._api_key or (env.str("DAYTONA_API_KEY", None) if not self._jwt_token else None)
-            self._jwt_token = self._jwt_token or env.str("DAYTONA_JWT_TOKEN", None)
-            self._organization_id = self._organization_id or env.str("DAYTONA_ORGANIZATION_ID", None)
-            api_url = api_url or env.str("DAYTONA_API_URL", None) or env.str("DAYTONA_SERVER_URL", None)
-            self._target = self._target or env.str("DAYTONA_TARGET", None)
-
-            if env.str("DAYTONA_SERVER_URL", None) and not env.str("DAYTONA_API_URL", None):
+            if env_reader.get("DAYTONA_SERVER_URL") and not env_reader.get("DAYTONA_API_URL"):
                 warnings.warn(
                     "Environment variable `DAYTONA_SERVER_URL` is deprecated and will be removed in future versions. "
                     + "Use `DAYTONA_API_URL` instead.",
@@ -184,13 +182,15 @@ class AsyncDaytona:
         self._api_url = api_url or default_api_url
 
         if not self._api_key and not self._jwt_token:
-            raise DaytonaError("API key or JWT token is required")
+            raise DaytonaAuthenticationError("API key or JWT token is required")
 
         # Create API configuration without api_key
         configuration = Configuration(host=self._api_url)
+        pool_size = config.connection_pool_maxsize if config else 250
+        configuration.connection_pool_maxsize = pool_size  # pyright: ignore[reportAttributeAccessIssue]
         self._api_client: ApiClient = ApiClient(configuration)
         self._api_client.default_headers["Authorization"] = f"Bearer {self._api_key or self._jwt_token}"
-        self._api_client.default_headers["X-Daytona-Source"] = "python-sdk"
+        self._api_client.default_headers["X-Daytona-Source"] = "sdk-python-async"
 
         # Get SDK version dynamically
         try:
@@ -209,11 +209,14 @@ class AsyncDaytona:
             # Fallback version if neither package metadata is available
             sdk_version = "unknown"
         self._api_client.default_headers["X-Daytona-SDK-Version"] = sdk_version
+        self._api_client.user_agent = f"sdk-python-async/{sdk_version}"
 
         if not self._api_key:
             if not self._organization_id:
-                raise DaytonaError("Organization ID is required when using JWT token")
+                raise DaytonaAuthenticationError("Organization ID is required when using JWT token")
             self._api_client.default_headers["X-Daytona-Organization-ID"] = self._organization_id
+
+        self._pool_tracker: AsyncPoolSaturationTracker = AsyncPoolSaturationTracker(pool_size)
 
         # Initialize API clients with the api_client instance
         self._sandbox_api: SandboxApi = SandboxApi(self._api_client)
@@ -230,9 +233,9 @@ class AsyncDaytona:
         )
 
         # Initialize OpenTelemetry if enabled
-        otel_enabled = (config and config._experimental and config._experimental.get("otelEnabled")) or os.environ.get(
-            "DAYTONA_EXPERIMENTAL_OTEL_ENABLED"
-        ) == "true"
+        otel_enabled = (config and config._experimental and config._experimental.get("otelEnabled")) or (
+            env_reader or DaytonaEnvReader()
+        ).get("DAYTONA_EXPERIMENTAL_OTEL_ENABLED") == "true"
         if otel_enabled:
             self._init_otel(sdk_version)
 
@@ -438,13 +441,13 @@ class AsyncDaytona:
         code_toolbox = self._get_code_toolbox(params.language)
 
         if timeout and timeout < 0:
-            raise DaytonaError("Timeout must be a non-negative number")
+            raise DaytonaValidationError("Timeout must be a non-negative number")
 
         if params.auto_stop_interval is not None and params.auto_stop_interval < 0:
-            raise DaytonaError("auto_stop_interval must be a non-negative integer")
+            raise DaytonaValidationError("auto_stop_interval must be a non-negative integer")
 
         if params.auto_archive_interval is not None and params.auto_archive_interval < 0:
-            raise DaytonaError("auto_archive_interval must be a non-negative integer")
+            raise DaytonaValidationError("auto_archive_interval must be a non-negative integer")
 
         target = self._target
 
@@ -527,6 +530,7 @@ class AsyncDaytona:
             self._toolbox_api_client,
             self._sandbox_api,
             code_toolbox,
+            self._pool_tracker,
         )
 
         if sandbox.state != SandboxState.STARTED:
@@ -553,7 +557,7 @@ class AsyncDaytona:
 
         enum_language = to_enum(CodeLanguage, language)
         if enum_language is None:
-            raise DaytonaError(f"Unsupported language: {language}")
+            raise DaytonaValidationError(f"Unsupported language: {language}")
         language = enum_language
 
         toolboxes = {
@@ -565,7 +569,7 @@ class AsyncDaytona:
         try:
             return toolboxes[language.value]()
         except KeyError as e:
-            raise DaytonaError(f"Unsupported language: {language}") from e
+            raise DaytonaValidationError(f"Unsupported language: {language}") from e
 
     @with_instrumentation()
     async def delete(self, sandbox: AsyncSandbox, timeout: float = 60) -> None:
@@ -609,7 +613,7 @@ class AsyncDaytona:
             ```
         """
         if not sandbox_id_or_name:
-            raise DaytonaError("sandbox_id_or_name is required")
+            raise DaytonaValidationError("sandbox_id_or_name is required")
 
         # Get the sandbox instance
         sandbox_instance = await self._sandbox_api.get_sandbox(sandbox_id_or_name)
@@ -621,6 +625,7 @@ class AsyncDaytona:
             self._toolbox_api_client,
             self._sandbox_api,
             code_toolbox,
+            self._pool_tracker,
         )
 
     @intercept_errors(message_prefix="Failed to list sandboxes: ")
@@ -646,10 +651,10 @@ class AsyncDaytona:
             ```
         """
         if page is not None and page < 1:
-            raise DaytonaError("page must be a positive integer")
+            raise DaytonaValidationError("page must be a positive integer")
 
         if limit is not None and limit < 1:
-            raise DaytonaError("limit must be a positive integer")
+            raise DaytonaValidationError("limit must be a positive integer")
 
         response = await self._sandbox_api.list_sandboxes_paginated(labels=json.dumps(labels), page=page, limit=limit)
 
@@ -660,6 +665,7 @@ class AsyncDaytona:
                     self._toolbox_api_client,
                     self._sandbox_api,
                     self._get_code_toolbox(self._validate_language_label(sandbox.labels.get("code-toolbox-language"))),
+                    self._pool_tracker,
                 )
                 for sandbox in response.items
             ],
@@ -685,7 +691,7 @@ class AsyncDaytona:
 
         enum_language = to_enum(CodeLanguage, language)
         if enum_language is None:
-            raise DaytonaError(f"Invalid code-toolbox-language: {language}")
+            raise DaytonaValidationError(f"Invalid code-toolbox-language: {language}")
         return enum_language
 
     @with_instrumentation()

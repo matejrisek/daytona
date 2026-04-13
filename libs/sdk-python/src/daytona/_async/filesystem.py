@@ -11,6 +11,8 @@ import aiofiles
 import aiofiles.os
 import httpx
 from aiofiles.threadpool.binary import AsyncBufferedIOBase
+from python_multipart.multipart import MultipartParser, parse_options_header
+
 from daytona_toolbox_api_client_async import (
     FileInfo,
     FilesDownloadRequest,
@@ -20,12 +22,18 @@ from daytona_toolbox_api_client_async import (
     ReplaceResult,
     SearchFilesResponse,
 )
-from python_multipart.multipart import MultipartParser, parse_options_header
 
 from .._utils.errors import intercept_errors
 from .._utils.otel_decorator import with_instrumentation
 from ..common.errors import DaytonaError
-from ..common.filesystem import FileDownloadRequest, FileDownloadResponse, FileUpload
+from ..common.filesystem import (
+    FileDownloadErrorDetails,
+    FileDownloadRequest,
+    FileDownloadResponse,
+    FileUpload,
+    create_file_download_error,
+    parse_file_download_error_payload,
+)
 
 
 class AsyncFileSystem:
@@ -143,7 +151,7 @@ class AsyncFileSystem:
             timeout = int(args[1]) if len(args) == 2 else 30 * 60
             response = (await self.download_files([FileDownloadRequest(source=remote_path)], timeout=timeout))[0]
             if response.error:
-                raise DaytonaError(response.error)
+                raise create_file_download_error(response)
             result = response.result
             if isinstance(result, str):
                 result = result.encode("utf-8")
@@ -158,7 +166,7 @@ class AsyncFileSystem:
             )
         )[0]
         if response.error:
-            raise DaytonaError(response.error)
+            raise create_file_download_error(response)
         return None
 
     @intercept_errors(message_prefix="Failed to download files: ")
@@ -177,7 +185,8 @@ class AsyncFileSystem:
 
         Raises:
             Exception: Only if the request itself fails (network issues, invalid request/response, etc.). Individual
-            file download errors are returned in the `FileDownloadResponse.error` field.
+            file download errors are returned in `FileDownloadResponse.error`. When the daemon provides structured
+            per-file metadata, it is also available in `FileDownloadResponse.error_details`.
 
         Example:
             ```python
@@ -200,6 +209,7 @@ class AsyncFileSystem:
             def __init__(self, dst: str | None):
                 self.dst: str | None = dst
                 self.error: str | None = None
+                self.error_details: FileDownloadErrorDetails | None = None
                 self.result: str | bytes | io.BytesIO | None = None
 
         src_file_meta_dict: dict[str, FileMeta] = {}
@@ -232,14 +242,20 @@ class AsyncFileSystem:
 
                     writer: io.BytesIO | AsyncBufferedIOBase | None = None
                     mode: str | None = None
+                    part_content_type: str | None = None
                     source: str | None = None
                     header_field = bytearray()
                     header_value = bytearray()
-                    part_headers: dict[str, str] = {}
+                    pending_headers: list[tuple[str, str]] = []
                     error_buffer = bytearray()
                     events: list[tuple[str, Any]] = []
 
                     def on_part_begin() -> None:
+                        # Keep callback-owned header state local and communicate via immutable
+                        # event payloads to avoid deferred-processing state races.
+                        pending_headers.clear()
+                        header_field.clear()
+                        header_value.clear()
                         events.append(("begin", None))
 
                     def on_header_field(data: bytes, start: int, end: int) -> None:
@@ -251,12 +267,12 @@ class AsyncFileSystem:
                     def on_header_end() -> None:
                         field = bytes(header_field).decode("utf-8", errors="ignore").lower()
                         value = bytes(header_value).decode("utf-8", errors="ignore")
-                        part_headers[field] = value
+                        pending_headers.append((field, value))
                         header_field.clear()
                         header_value.clear()
 
                     def on_headers_finished() -> None:
-                        events.append(("headers_finished", dict(part_headers)))
+                        events.append(("headers_finished", dict(pending_headers)))
 
                     def on_part_data(data: bytes, start: int, end: int) -> None:
                         events.append(("data", bytes(data[start:end])))
@@ -278,13 +294,13 @@ class AsyncFileSystem:
                     )
 
                     async def _process_events() -> None:
-                        nonlocal writer, mode, source
+                        nonlocal writer, mode, part_content_type, source
                         for event_tag, event_payload in events:
                             if event_tag == "begin":
-                                part_headers.clear()
                                 error_buffer.clear()
                                 writer = None
                                 mode = None
+                                part_content_type = None
                                 source = None
 
                             elif event_tag == "headers_finished":
@@ -295,6 +311,7 @@ class AsyncFileSystem:
                                 source = cd_params.get(b"filename", b"").decode("utf-8", errors="ignore") or None
                                 if not source:
                                     raise DaytonaError("No source path found for this file")
+                                part_content_type = hdrs.get("content-type")
 
                                 if name == "error":
                                     mode = "error"
@@ -332,9 +349,13 @@ class AsyncFileSystem:
 
                             elif event_tag == "end":
                                 if mode == "error" and error_buffer:
-                                    error_text = bytes(error_buffer).decode("utf-8", errors="ignore").strip()
+                                    error_text, error_details = parse_file_download_error_payload(
+                                        bytes(error_buffer),
+                                        part_content_type,
+                                    )
                                     if source:
                                         src_file_meta_dict[source].error = error_text
+                                        src_file_meta_dict[source].error_details = error_details
                                     else:
                                         raise DaytonaError(f"Error happened for unknown file with error {error_text}")
                                     error_buffer.clear()
@@ -342,6 +363,7 @@ class AsyncFileSystem:
                                     await writer.close()
                                 writer = None
                                 mode = None
+                                part_content_type = None
                                 source = None
 
                     async for chunk in resp.aiter_bytes(64 * 1024):
@@ -375,6 +397,7 @@ class AsyncFileSystem:
                     source=f.source,
                     result=res,
                     error=err,
+                    error_details=meta.error_details,
                 )
             )
 
@@ -739,4 +762,13 @@ class AsyncFileSystem:
                 response = await client.post(
                     url, data=data_fields, files=file_fields, headers=headers  # any non-file form fields
                 )
-                _ = response.raise_for_status()
+
+                if not response.is_success:
+                    try:
+                        detail = ", ".join(response.json()["errors"])
+                    except Exception:
+                        detail = response.text
+                    raise DaytonaError(
+                        f"{response.status_code}: {detail}",
+                        status_code=response.status_code,
+                    )

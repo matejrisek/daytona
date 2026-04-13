@@ -14,6 +14,7 @@ import { SandboxClass } from '../enums/sandbox-class.enum'
 import { SandboxDesiredState } from '../enums/sandbox-desired-state.enum'
 import { RunnerService } from './runner.service'
 import { SandboxError } from '../../exceptions/sandbox-error.exception'
+import { StateChangeInProgressError } from '../../exceptions/state-change-in-progress.exception'
 import { BadRequestError } from '../../exceptions/bad-request.exception'
 import { Cron, CronExpression } from '@nestjs/schedule'
 import { BackupState } from '../enums/backup-state.enum'
@@ -67,6 +68,7 @@ import { customAlphabet as customNanoid, nanoid, urlAlphabet } from 'nanoid'
 import { WithInstrumentation } from '../../common/decorators/otel.decorator'
 import { validateMountPaths, validateSubpaths } from '../utils/volume-mount-path-validation.util'
 import { SandboxRepository } from '../repositories/sandbox.repository'
+import { SnapshotRepository } from '../repositories/snapshot.repository'
 import { PortPreviewUrlDto, SignedPortPreviewUrlDto } from '../dto/port-preview-url.dto'
 import { RegionService } from '../../region/services/region.service'
 import { DefaultRegionRequiredException } from '../../organization/exceptions/DefaultRegionRequiredException'
@@ -87,14 +89,12 @@ import {
 } from '../utils/sandbox-lookup-cache.util'
 import { SandboxLookupCacheInvalidationService } from './sandbox-lookup-cache-invalidation.service'
 import { Region } from '../../region/entities/region.entity'
+import { SandboxActivityService } from './sandbox-activity.service'
 
 const DEFAULT_CPU = 1
 const DEFAULT_MEMORY = 1
 const DEFAULT_DISK = 3
 const DEFAULT_GPU = 0
-
-const LAST_ACTIVITY_LOCK_KEY_PREFIX = 'sandbox:update-last-activity'
-const LAST_ACTIVITY_LOCK_TTL_SECONDS = 45
 
 @Injectable()
 export class SandboxService {
@@ -102,8 +102,7 @@ export class SandboxService {
 
   constructor(
     private readonly sandboxRepository: SandboxRepository,
-    @InjectRepository(Snapshot)
-    private readonly snapshotRepository: Repository<Snapshot>,
+    private readonly snapshotRepository: SnapshotRepository,
     @InjectRepository(Runner)
     private readonly runnerRepository: Repository<Runner>,
     @InjectRepository(BuildInfo)
@@ -123,6 +122,7 @@ export class SandboxService {
     private readonly regionService: RegionService,
     private readonly snapshotService: SnapshotService,
     private readonly sandboxLookupCacheInvalidationService: SandboxLookupCacheInvalidationService,
+    private readonly sandboxActivityService: SandboxActivityService,
   ) {}
 
   protected getLockKey(id: string): string {
@@ -273,7 +273,7 @@ export class SandboxService {
     this.assertSandboxNotErrored(sandbox)
 
     if (String(sandbox.state) !== String(sandbox.desiredState)) {
-      throw new SandboxError('State change in progress')
+      throw new StateChangeInProgressError()
     }
 
     if (sandbox.state !== SandboxState.STOPPED) {
@@ -281,7 +281,7 @@ export class SandboxService {
     }
 
     if (sandbox.pending) {
-      throw new SandboxError('Sandbox state change in progress')
+      throw new StateChangeInProgressError()
     }
 
     if (sandbox.autoDeleteInterval === 0) {
@@ -517,9 +517,10 @@ export class SandboxService {
       sandbox.pending = true
 
       const insertedSandbox = await this.sandboxRepository.insert(sandbox)
-      this.primeLastActivityLock(insertedSandbox.id)
 
-      this.eventEmitter.emit(SandboxEvents.CREATED, new SandboxCreatedEvent(insertedSandbox))
+      this.eventEmitter
+        .emitAsync(SandboxEvents.CREATED, new SandboxCreatedEvent(insertedSandbox))
+        .catch((err) => this.logger.error('Failed to emit SandboxCreatedEvent', err))
 
       return this.toSandboxDto(insertedSandbox)
     } catch (error) {
@@ -550,7 +551,6 @@ export class SandboxService {
       labels: createSandboxDto.labels || {},
       organizationId: organization.id,
       createdAt: now,
-      lastActivityAt: now,
     }
 
     if (createSandboxDto.name) {
@@ -600,7 +600,6 @@ export class SandboxService {
       updateData,
       entity: warmPoolSandbox,
     })
-    this.primeLastActivityLock(updatedSandbox.id)
 
     // Defensive invalidation of orgId cache since the sandbox moved from unassigned to a real organization
     this.sandboxLookupCacheInvalidationService.invalidateOrgId({
@@ -742,9 +741,10 @@ export class SandboxService {
       sandbox.pending = true
 
       const insertedSandbox = await this.sandboxRepository.insert(sandbox)
-      this.primeLastActivityLock(insertedSandbox.id)
 
-      this.eventEmitter.emit(SandboxEvents.CREATED, new SandboxCreatedEvent(insertedSandbox))
+      this.eventEmitter
+        .emitAsync(SandboxEvents.CREATED, new SandboxCreatedEvent(insertedSandbox))
+        .catch((err) => this.logger.error('Failed to emit SandboxCreatedEvent', err))
 
       return this.toSandboxDto(insertedSandbox)
     } catch (error) {
@@ -867,7 +867,7 @@ export class SandboxService {
     baseFindOptions.cpu = createRangeFilter(minCpu, maxCpu)
     baseFindOptions.mem = createRangeFilter(minMemoryGiB, maxMemoryGiB)
     baseFindOptions.disk = createRangeFilter(minDiskGiB, maxDiskGiB)
-    baseFindOptions.lastActivityAt = createRangeFilter(lastEventAfter, lastEventBefore)
+    baseFindOptions.updatedAt = createRangeFilter(lastEventAfter, lastEventBefore)
 
     const statesToInclude = (states || Object.values(SandboxState)).filter((state) => state !== SandboxState.DESTROYED)
     const errorStates = [SandboxState.ERROR, SandboxState.BUILD_FAILED]
@@ -1237,7 +1237,7 @@ export class SandboxService {
     const sandbox = await this.findOneByIdOrName(sandboxIdOrName, organizationId)
 
     if (sandbox.pending && sandbox.state !== SandboxState.PENDING_BUILD) {
-      throw new SandboxError('Sandbox state change in progress')
+      throw new StateChangeInProgressError()
     }
 
     const updateData = Sandbox.getSoftDeleteUpdate(sandbox)
@@ -1276,7 +1276,7 @@ export class SandboxService {
           sandbox.desiredState !== SandboxDesiredState.ARCHIVED ||
           (sandbox.state !== SandboxState.STOPPED && sandbox.state !== SandboxState.ARCHIVING)
         ) {
-          throw new SandboxError('State change in progress')
+          throw new StateChangeInProgressError()
         }
       }
 
@@ -1285,7 +1285,7 @@ export class SandboxService {
       }
 
       if (sandbox.pending) {
-        throw new SandboxError('Sandbox state change in progress')
+        throw new StateChangeInProgressError()
       }
 
       this.organizationService.assertOrganizationIsNotSuspended(organization)
@@ -1329,13 +1329,13 @@ export class SandboxService {
     }
   }
 
-  async stop(sandboxIdOrName: string, organizationId?: string): Promise<Sandbox> {
+  async stop(sandboxIdOrName: string, organizationId?: string, force?: boolean): Promise<Sandbox> {
     const sandbox = await this.findOneByIdOrName(sandboxIdOrName, organizationId)
 
     this.assertSandboxNotErrored(sandbox)
 
     if (String(sandbox.state) !== String(sandbox.desiredState)) {
-      throw new SandboxError('State change in progress')
+      throw new StateChangeInProgressError()
     }
 
     if (sandbox.state !== SandboxState.STARTED) {
@@ -1343,7 +1343,7 @@ export class SandboxService {
     }
 
     if (sandbox.pending) {
-      throw new SandboxError('Sandbox state change in progress')
+      throw new StateChangeInProgressError()
     }
 
     const updateData: Partial<Sandbox> = {
@@ -1359,7 +1359,7 @@ export class SandboxService {
     if (sandbox.autoDeleteInterval === 0) {
       this.eventEmitter.emit(SandboxEvents.DESTROYED, new SandboxDestroyedEvent(updatedSandbox))
     } else {
-      this.eventEmitter.emit(SandboxEvents.STOPPED, new SandboxStoppedEvent(updatedSandbox))
+      this.eventEmitter.emit(SandboxEvents.STOPPED, new SandboxStoppedEvent(updatedSandbox, force))
     }
 
     return updatedSandbox
@@ -1373,7 +1373,7 @@ export class SandboxService {
     }
 
     if (sandbox.pending) {
-      throw new SandboxError('Sandbox state change in progress')
+      throw new StateChangeInProgressError()
     }
 
     // Validate runner exists
@@ -1437,7 +1437,7 @@ export class SandboxService {
       }
 
       if (sandbox.pending) {
-        throw new SandboxError('Sandbox state change in progress')
+        throw new StateChangeInProgressError()
       }
 
       // If no resize parameters provided, throw error
@@ -1627,18 +1627,7 @@ export class SandboxService {
   }
 
   async updateLastActivityAt(sandboxId: string, lastActivityAt: Date): Promise<void> {
-    const lockKey = `${LAST_ACTIVITY_LOCK_KEY_PREFIX}:${sandboxId}`
-    const acquired = await this.redisLockProvider.lock(lockKey, LAST_ACTIVITY_LOCK_TTL_SECONDS)
-    if (!acquired) {
-      return
-    }
-
-    await this.sandboxRepository.update(sandboxId, { updateData: { lastActivityAt } }, true)
-  }
-
-  private primeLastActivityLock(sandboxId: string): void {
-    const lockKey = `${LAST_ACTIVITY_LOCK_KEY_PREFIX}:${sandboxId}`
-    void this.redisLockProvider.lock(lockKey, LAST_ACTIVITY_LOCK_TTL_SECONDS)
+    await this.sandboxActivityService.updateLastActivityAt(sandboxId, lastActivityAt)
   }
 
   async getToolboxProxyUrl(sandboxId: string): Promise<string> {

@@ -28,7 +28,7 @@ import { OrganizationModule } from '../organization/organization.module'
 import { SandboxWarmPoolService } from './services/sandbox-warm-pool.service'
 import { WarmPool } from './entities/warm-pool.entity'
 import { PreviewController } from './controllers/preview.controller'
-import { SnapshotSubscriber } from './subscribers/snapshot.subscriber'
+import { SnapshotRepository } from './repositories/snapshot.repository'
 import { VolumeController } from './controllers/volume.controller'
 import { VolumeService } from './services/volume.service'
 import { VolumeManager } from './managers/volume.manager'
@@ -54,13 +54,11 @@ import { JobService } from './services/job.service'
 import { JobStateHandlerService } from './services/job-state-handler.service'
 import { Job } from './entities/job.entity'
 import { SandboxLookupCacheInvalidationService } from './services/sandbox-lookup-cache-invalidation.service'
-import { SandboxAccessGuard } from './guards/sandbox-access.guard'
-import { RunnerAccessGuard } from './guards/runner-access.guard'
-import { RegionRunnerAccessGuard } from './guards/region-runner-access.guard'
-import { RegionSandboxAccessGuard } from './guards/region-sandbox-access.guard'
-import { ProxyGuard } from './guards/proxy.guard'
-import { SshGatewayGuard } from './guards/ssh-gateway.guard'
+import { ProxyAuthContextGuard } from './guards/proxy-auth-context.guard'
+import { SshGatewayAuthContextGuard } from './guards/ssh-gateway-auth-context.guard'
 import { EventEmitter2 } from '@nestjs/event-emitter'
+import { SandboxLastActivity } from './entities/sandbox-last-activity.entity'
+import { SandboxActivityService } from './services/sandbox-activity.service'
 
 @Module({
   imports: [
@@ -81,6 +79,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter'
       SshAccess,
       Region,
       Job,
+      SandboxLastActivity,
     ]),
   ],
   controllers: [
@@ -105,7 +104,6 @@ import { EventEmitter2 } from '@nestjs/event-emitter'
     SandboxLookupCacheInvalidationService,
     SnapshotManager,
     RedisLockProvider,
-    SnapshotSubscriber,
     VolumeService,
     VolumeManager,
     VolumeSubscriber,
@@ -117,12 +115,9 @@ import { EventEmitter2 } from '@nestjs/event-emitter'
     SandboxArchiveAction,
     JobService,
     JobStateHandlerService,
-    SandboxAccessGuard,
-    RunnerAccessGuard,
-    RegionRunnerAccessGuard,
-    RegionSandboxAccessGuard,
-    ProxyGuard,
-    SshGatewayGuard,
+    SandboxActivityService,
+    ProxyAuthContextGuard,
+    SshGatewayAuthContextGuard,
     {
       provide: SandboxRepository,
       inject: [DataSource, EventEmitter2, SandboxLookupCacheInvalidationService],
@@ -131,6 +126,12 @@ import { EventEmitter2 } from '@nestjs/event-emitter'
         eventEmitter: EventEmitter2,
         sandboxLookupCacheInvalidationService: SandboxLookupCacheInvalidationService,
       ) => new SandboxRepository(dataSource, eventEmitter, sandboxLookupCacheInvalidationService),
+    },
+    {
+      provide: SnapshotRepository,
+      inject: [DataSource, EventEmitter2],
+      useFactory: (dataSource: DataSource, eventEmitter: EventEmitter2) =>
+        new SnapshotRepository(dataSource, eventEmitter),
     },
   ],
   exports: [
@@ -141,7 +142,11 @@ import { EventEmitter2 } from '@nestjs/event-emitter'
     VolumeService,
     VolumeManager,
     SandboxRepository,
+    SnapshotRepository,
     RunnerAdapterFactory,
+    SandboxActivityService,
+    ProxyAuthContextGuard,
+    SshGatewayAuthContextGuard,
   ],
 })
 export class SandboxModule {}

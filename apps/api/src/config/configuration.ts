@@ -319,10 +319,16 @@ const configuration = {
     password: process.env.CLICKHOUSE_PASSWORD,
     protocol: process.env.CLICKHOUSE_PROTOCOL || 'https',
   },
+  sandboxActivity: {
+    throttleTtlSeconds: parseInt(process.env.SANDBOX_ACTIVITY_THROTTLE_TTL_SECONDS || '5', 10),
+    flushBatchSize: parseInt(process.env.SANDBOX_ACTIVITY_FLUSH_BATCH_SIZE || '1000', 10),
+  },
   encryption: {
     key: process.env.ENCRYPTION_KEY,
     salt: process.env.ENCRYPTION_SALT,
   },
+  failedSnapshotRunnerRetentionHours: parseInt(process.env.FAILED_SNAPSHOT_RUNNER_RETENTION_HOURS || '3', 10),
+  buildInfoSnapshotRunnerStalenessDays: parseInt(process.env.BUILDINFO_SNAPSHOT_RUNNER_STALENESS_DAYS || '7', 10),
 }
 
 export { configuration }

@@ -7,13 +7,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/daytonaio/common-go/pkg/log"
 	"github.com/daytonaio/common-go/pkg/telemetry"
 	"github.com/daytonaio/daemon/internal"
 )
 
-func (s *server) initTelemetry(ctx context.Context, serviceName, entrypointLogFilePath string, organizationId, regionId *string) error {
+func (s *server) initTelemetry(ctx context.Context, serviceName, entrypointLogFilePath string, organizationId, regionId, snapshot *string) error {
 	if s.otelEndpoint == nil {
 		s.logger.InfoContext(ctx, "Otel endpoint not provided, skipping telemetry initialization")
 		return nil
@@ -47,12 +48,32 @@ func (s *server) initTelemetry(ctx context.Context, serviceName, entrypointLogFi
 	}
 
 	extraLabels := make(map[string]string)
+
+	if envLabels := os.Getenv("DAYTONA_SANDBOX_OTEL_EXTRA_LABELS"); envLabels != "" {
+		for pair := range strings.SplitSeq(envLabels, ",") {
+			parts := strings.SplitN(pair, "=", 2)
+			if len(parts) != 2 {
+				s.logger.WarnContext(ctx, "Skipping malformed extra label", "label", pair)
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			if key != "" {
+				extraLabels[key] = value
+			}
+		}
+	}
+
 	if organizationId != nil && *organizationId != "" {
 		extraLabels["daytona_organization_id"] = *organizationId
 	}
 
 	if regionId != nil && *regionId != "" {
 		extraLabels["daytona_region_id"] = *regionId
+	}
+
+	if snapshot != nil && *snapshot != "" {
+		extraLabels["daytona_snapshot"] = *snapshot
 	}
 
 	if len(extraLabels) > 0 {
