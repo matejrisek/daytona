@@ -42,6 +42,7 @@ import { getStateChangeLockKey } from '../utils/lock-key.util'
 import { BackupState } from '../enums/backup-state.enum'
 import { OnAsyncEvent } from '../../common/decorators/on-async-event.decorator'
 import { sanitizeSandboxError } from '../utils/sanitize-error.util'
+import { isEphemeral } from '../utils/ephemeral.util'
 import { Sandbox } from '../entities/sandbox.entity'
 import { RunnerAdapterFactory } from '../runner-adapter/runnerAdapter'
 import { DockerRegistryService } from '../../docker-registry/services/docker-registry.service'
@@ -130,8 +131,7 @@ export class SandboxManager implements TrackableJobExecutions, OnApplicationShut
 
               let updateData: Partial<Sandbox> = {}
 
-              //  if auto-delete interval is 0, delete the sandbox immediately
-              if (sandbox.autoDeleteInterval === 0) {
+              if (isEphemeral(sandbox)) {
                 updateData = Sandbox.getSoftDeleteUpdate(sandbox)
               } else {
                 updateData.pending = true
@@ -683,6 +683,8 @@ export class SandboxManager implements TrackableJobExecutions, OnApplicationShut
             SandboxState.ERROR,
             SandboxState.BUILD_FAILED,
             SandboxState.RESIZING,
+            SandboxState.FORKING,
+            SandboxState.SNAPSHOTTING,
           ],
         })
         .andWhere('sandbox."desiredState"::text != sandbox.state::text')
@@ -830,7 +832,13 @@ export class SandboxManager implements TrackableJobExecutions, OnApplicationShut
 
       while (new Date().getTime() - startedAt.getTime() <= 10000) {
         if (
-          [SandboxState.DESTROYED, SandboxState.BUILD_FAILED, SandboxState.RESIZING].includes(sandbox.state) ||
+          [
+            SandboxState.DESTROYED,
+            SandboxState.BUILD_FAILED,
+            SandboxState.RESIZING,
+            SandboxState.SNAPSHOTTING,
+            SandboxState.FORKING,
+          ].includes(sandbox.state) ||
           (sandbox.state === SandboxState.ERROR && sandbox.desiredState !== SandboxDesiredState.ARCHIVED)
         ) {
           // Break sync loop if sandbox reaches a terminal state.

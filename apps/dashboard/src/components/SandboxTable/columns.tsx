@@ -3,16 +3,19 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
+import React from 'react'
 import { formatTimestamp, getRelativeTimeString } from '@/lib/utils'
 import { Sandbox, SandboxDesiredState, SandboxState } from '@daytona/api-client'
 import { ColumnDef } from '@tanstack/react-table'
 import { ArrowDown, ArrowUp } from 'lucide-react'
-import React from 'react'
 import { EllipsisWithTooltip } from '../EllipsisWithTooltip'
 import { Checkbox } from '../ui/checkbox'
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip'
 import { SandboxState as SandboxStateComponent } from './SandboxState'
 import { SandboxTableActions } from './SandboxTableActions'
+import { STATE_PRIORITY_ORDER } from './constants'
+import { ResourceFilterValue } from './filters/ResourceFilter'
+import { arrayIncludesFilter, arrayIntersectionFilter, resourceRangeFilter, dateRangeFilter } from './filters/utils'
 
 interface SortableHeaderProps {
   column: any
@@ -55,6 +58,9 @@ interface GetColumnsProps {
   handleRecover: (id: string) => void
   getRegionName: (regionId: string) => string | undefined
   handleScreenRecordings: (id: string) => void
+  handleCreateSnapshot: (id: string) => void
+  handleFork: (id: string) => void
+  handleViewForks: (id: string) => void
 }
 
 export function getColumns({
@@ -72,6 +78,9 @@ export function getColumns({
   handleRecover,
   getRegionName,
   handleScreenRecordings,
+  handleCreateSnapshot,
+  handleFork,
+  handleViewForks,
 }: GetColumnsProps): ColumnDef<Sandbox>[] {
   const handleOpenWebTerminal = async (sandboxId: string) => {
     const url = await getWebTerminalUrl(sandboxId)
@@ -172,6 +181,17 @@ export function getColumns({
         </div>
       ),
       accessorKey: 'state',
+      sortingFn: (rowA, rowB) => {
+        const stateA = rowA.original.state || SandboxState.UNKNOWN
+        const stateB = rowB.original.state || SandboxState.UNKNOWN
+
+        if (stateA === stateB) {
+          return 0
+        }
+
+        return STATE_PRIORITY_ORDER[stateA] - STATE_PRIORITY_ORDER[stateB]
+      },
+      filterFn: (row, id, value) => arrayIncludesFilter(row, id, value),
     },
     {
       id: 'snapshot',
@@ -193,6 +213,7 @@ export function getColumns({
         )
       },
       accessorKey: 'snapshot',
+      filterFn: (row, id, value) => arrayIncludesFilter(row, id, value),
     },
     {
       id: 'region',
@@ -210,6 +231,7 @@ export function getColumns({
         )
       },
       accessorKey: 'target',
+      filterFn: (row, id, value) => arrayIncludesFilter(row, id, value),
     },
     {
       id: 'resources',
@@ -236,6 +258,7 @@ export function getColumns({
           </div>
         )
       },
+      filterFn: (row, id, value: ResourceFilterValue) => resourceRangeFilter(row, value),
     },
     {
       id: 'labels',
@@ -271,6 +294,7 @@ export function getColumns({
         )
       },
       accessorFn: (row) => Object.entries(row.labels ?? {}).map(([key, value]) => `${key}: ${value}`),
+      filterFn: (row, id, value) => arrayIntersectionFilter(row, id, value),
     },
     {
       id: 'lastEvent',
@@ -280,6 +304,7 @@ export function getColumns({
       header: ({ column }) => {
         return <SortableHeader column={column} label="Last Event" />
       },
+      filterFn: (row, id, value) => dateRangeFilter(row, id, value),
       accessorFn: (row) => getLastEvent(row).date,
       cell: ({ row }) => {
         const lastEvent = getLastEvent(row.original)
@@ -298,6 +323,7 @@ export function getColumns({
       header: ({ column }) => {
         return <SortableHeader column={column} label="Created At" />
       },
+      accessorFn: (row) => (row.createdAt ? new Date(row.createdAt) : new Date()),
       cell: ({ row }) => {
         const timestamp = formatTimestamp(row.original.createdAt)
         return (
@@ -328,6 +354,9 @@ export function getColumns({
             onRevokeSshAccess={handleRevokeSshAccess}
             onRecover={handleRecover}
             onScreenRecordings={handleScreenRecordings}
+            onCreateSnapshot={() => handleCreateSnapshot(row.original.id)}
+            onFork={() => handleFork(row.original.id)}
+            onViewForks={() => handleViewForks(row.original.id)}
           />
         </div>
       ),
@@ -352,5 +381,5 @@ function getDisplayName(sandbox: Sandbox): string {
 }
 
 function getLastEvent(sandbox: Sandbox): { date: Date; relativeTimeString: string } {
-  return getRelativeTimeString(sandbox.updatedAt)
+  return getRelativeTimeString(sandbox.lastActivityAt ?? sandbox.updatedAt)
 }

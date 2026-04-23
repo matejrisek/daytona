@@ -3,15 +3,27 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
-import { ForbiddenException, Injectable, Logger, NotFoundException, ConflictException } from '@nestjs/common'
+import {
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  ConflictException,
+  HttpException,
+  HttpStatus,
+} from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
 import { Not, Repository, LessThan, In, JsonContains, FindOptionsWhere, ILike } from 'typeorm'
 import { Sandbox } from '../entities/sandbox.entity'
+import { SandboxFork } from '../entities/sandbox-fork.entity'
 import { CreateSandboxDto } from '../dto/create-sandbox.dto'
+import { CreateSandboxSnapshotDto } from '../dto/create-sandbox-snapshot.dto'
+import { ForkSandboxDto } from '../dto/fork-sandbox.dto'
 import { ResizeSandboxDto } from '../dto/resize-sandbox.dto'
 import { SandboxState } from '../enums/sandbox-state.enum'
 import { SandboxClass } from '../enums/sandbox-class.enum'
 import { SandboxDesiredState } from '../enums/sandbox-desired-state.enum'
+import { RunnerClass } from '../enums/runner-class.enum'
 import { RunnerService } from './runner.service'
 import { SandboxError } from '../../exceptions/sandbox-error.exception'
 import { StateChangeInProgressError } from '../../exceptions/state-change-in-progress.exception'
@@ -67,13 +79,17 @@ import { RedisLockProvider } from '../common/redis-lock.provider'
 import { customAlphabet as customNanoid, nanoid, urlAlphabet } from 'nanoid'
 import { WithInstrumentation } from '../../common/decorators/otel.decorator'
 import { validateMountPaths, validateSubpaths } from '../utils/volume-mount-path-validation.util'
+import { isEphemeral } from '../utils/ephemeral.util'
 import { SandboxRepository } from '../repositories/sandbox.repository'
 import { SnapshotRepository } from '../repositories/snapshot.repository'
 import { PortPreviewUrlDto, SignedPortPreviewUrlDto } from '../dto/port-preview-url.dto'
 import { RegionService } from '../../region/services/region.service'
 import { DefaultRegionRequiredException } from '../../organization/exceptions/DefaultRegionRequiredException'
 import { SnapshotService } from './snapshot.service'
+import { DockerRegistryService } from '../../docker-registry/services/docker-registry.service'
 import { RegionType } from '../../region/enums/region-type.enum'
+import { getEffectivePerSandboxLimits } from '../../organization/utils/sandbox-limits.util'
+import { RegionQuotaDto } from '../../organization/dto/region-quota.dto'
 import { SandboxCreatedEvent } from '../events/sandbox-create.event'
 import { InjectRedis } from '@nestjs-modules/ioredis'
 import { Redis } from 'ioredis'
@@ -123,6 +139,9 @@ export class SandboxService {
     private readonly snapshotService: SnapshotService,
     private readonly sandboxLookupCacheInvalidationService: SandboxLookupCacheInvalidationService,
     private readonly sandboxActivityService: SandboxActivityService,
+    private readonly dockerRegistryService: DockerRegistryService,
+    @InjectRepository(SandboxFork)
+    private readonly sandboxForkRepository: Repository<SandboxFork>,
   ) {}
 
   protected getLockKey(id: string): string {
@@ -141,27 +160,47 @@ export class SandboxService {
     cpu: number,
     memory: number,
     disk: number,
+    ephemeral: boolean,
     excludeSandboxId?: string,
+    regionQuota?: RegionQuotaDto | null,
   ): Promise<{
     pendingCpuIncremented: boolean
     pendingMemoryIncremented: boolean
     pendingDiskIncremented: boolean
   }> {
+    if (!regionQuota && region.enforceQuotas) {
+      regionQuota = await this.organizationService.getRegionQuota(organization.id, region.id)
+    }
+
     // validate per-sandbox quotas
-    if (cpu > organization.maxCpuPerSandbox) {
+    const { maxCpuPerSandbox, maxMemoryPerSandbox, maxDiskPerSandbox, maxDiskPerNonEphemeralSandbox } =
+      getEffectivePerSandboxLimits(organization, regionQuota)
+
+    if (cpu > maxCpuPerSandbox) {
       throw new ForbiddenException(
-        `CPU request ${cpu} exceeds maximum allowed per sandbox (${organization.maxCpuPerSandbox}).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
+        `CPU request ${cpu} exceeds maximum allowed per sandbox (${maxCpuPerSandbox}).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
       )
     }
-    if (memory > organization.maxMemoryPerSandbox) {
+    if (memory > maxMemoryPerSandbox) {
       throw new ForbiddenException(
-        `Memory request ${memory}GB exceeds maximum allowed per sandbox (${organization.maxMemoryPerSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
+        `Memory request ${memory}GB exceeds maximum allowed per sandbox (${maxMemoryPerSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
       )
     }
-    if (disk > organization.maxDiskPerSandbox) {
+    if (disk > maxDiskPerSandbox) {
       throw new ForbiddenException(
-        `Disk request ${disk}GB exceeds maximum allowed per sandbox (${organization.maxDiskPerSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
+        `Disk request ${disk}GB exceeds maximum allowed per sandbox (${maxDiskPerSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
       )
+    }
+
+    if (!ephemeral && maxDiskPerNonEphemeralSandbox !== null) {
+      if (maxDiskPerNonEphemeralSandbox === 0) {
+        throw new BadRequestError('Only ephemeral sandboxes are permitted in this region')
+      }
+      if (disk > maxDiskPerNonEphemeralSandbox) {
+        throw new ForbiddenException(
+          `Disk request ${disk}GB exceeds maximum allowed per non-ephemeral sandbox (${maxDiskPerNonEphemeralSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
+        )
+      }
     }
 
     // e.g. region belonging to an organization
@@ -172,8 +211,6 @@ export class SandboxService {
         pendingDiskIncremented: false,
       }
     }
-
-    const regionQuota = await this.organizationService.getRegionQuota(organization.id, region.id)
 
     if (!regionQuota) {
       if (region.regionType === RegionType.SHARED) {
@@ -284,7 +321,7 @@ export class SandboxService {
       throw new StateChangeInProgressError()
     }
 
-    if (sandbox.autoDeleteInterval === 0) {
+    if (isEphemeral(sandbox)) {
       throw new SandboxError('Ephemeral sandboxes cannot be archived')
     }
 
@@ -425,7 +462,7 @@ export class SandboxService {
       this.organizationService.assertOrganizationIsNotSuspended(organization)
 
       const { pendingCpuIncremented, pendingMemoryIncremented, pendingDiskIncremented } =
-        await this.validateOrganizationQuotas(organization, region, cpu, mem, disk)
+        await this.validateOrganizationQuotas(organization, region, cpu, mem, disk, isEphemeral(createSandboxDto))
 
       if (pendingCpuIncremented) {
         pendingCpuIncrement = cpu
@@ -635,7 +672,7 @@ export class SandboxService {
       this.organizationService.assertOrganizationIsNotSuspended(organization)
 
       const { pendingCpuIncremented, pendingMemoryIncremented, pendingDiskIncremented } =
-        await this.validateOrganizationQuotas(organization, region, cpu, mem, disk)
+        await this.validateOrganizationQuotas(organization, region, cpu, mem, disk, isEphemeral(createSandboxDto))
 
       if (pendingCpuIncremented) {
         pendingCpuIncrement = cpu
@@ -696,6 +733,38 @@ export class SandboxService {
         createSandboxDto.buildInfo.contextHashes,
       )
 
+      let runner: Runner
+
+      try {
+        const declarativeBuildScoreThreshold = this.configService.get('runnerScore.thresholds.declarativeBuild')
+        runner = await this.runnerService.getRandomAvailableRunner({
+          regions: [sandbox.region],
+          sandboxClass: sandbox.class,
+          snapshotRef: buildInfoSnapshotRef,
+          ...(declarativeBuildScoreThreshold !== undefined && {
+            availabilityScoreThreshold: declarativeBuildScoreThreshold,
+          }),
+        })
+
+        if (runner.runnerClass !== RunnerClass.CONTAINER) {
+          throw new HttpException(
+            'Declarative build is not supported for the selected runner class',
+            HttpStatus.UNPROCESSABLE_ENTITY,
+          )
+        }
+
+        sandbox.runnerId = runner.id
+      } catch (error) {
+        if (
+          error instanceof BadRequestError == false ||
+          error.message !== 'No available runners' ||
+          !createSandboxDto.buildInfo
+        ) {
+          throw error
+        }
+        sandbox.state = SandboxState.PENDING_BUILD
+      }
+
       // Check if buildInfo with the same snapshotRef already exists
       const existingBuildInfo = await this.buildInfoRepository.findOne({
         where: { snapshotRef: buildInfoSnapshotRef },
@@ -712,30 +781,6 @@ export class SandboxService {
         })
         await this.buildInfoRepository.save(buildInfoEntity)
         sandbox.buildInfo = buildInfoEntity
-      }
-
-      let runner: Runner
-
-      try {
-        const declarativeBuildScoreThreshold = this.configService.get('runnerScore.thresholds.declarativeBuild')
-        runner = await this.runnerService.getRandomAvailableRunner({
-          regions: [sandbox.region],
-          sandboxClass: sandbox.class,
-          snapshotRef: sandbox.buildInfo.snapshotRef,
-          ...(declarativeBuildScoreThreshold !== undefined && {
-            availabilityScoreThreshold: declarativeBuildScoreThreshold,
-          }),
-        })
-        sandbox.runnerId = runner.id
-      } catch (error) {
-        if (
-          error instanceof BadRequestError == false ||
-          error.message !== 'No available runners' ||
-          !sandbox.buildInfo
-        ) {
-          throw error
-        }
-        sandbox.state = SandboxState.PENDING_BUILD
       }
 
       sandbox.pending = true
@@ -767,7 +812,7 @@ export class SandboxService {
   async createBackup(sandboxIdOrName: string, organizationId?: string): Promise<Sandbox> {
     const sandbox = await this.findOneByIdOrName(sandboxIdOrName, organizationId)
 
-    if (sandbox.autoDeleteInterval === 0) {
+    if (isEphemeral(sandbox)) {
       throw new SandboxError('Ephemeral sandboxes cannot be backed up')
     }
 
@@ -778,6 +823,290 @@ export class SandboxService {
     this.eventEmitter.emit(SandboxEvents.BACKUP_CREATED, new SandboxBackupCreatedEvent(sandbox))
 
     return sandbox
+  }
+
+  async forkSandbox(sandboxIdOrName: string, organization: Organization, dto: ForkSandboxDto): Promise<Sandbox> {
+    let pendingCpuIncrement: number | undefined
+    let pendingMemoryIncrement: number | undefined
+    let pendingDiskIncrement: number | undefined
+
+    const sourceSandbox = await this.findOneByIdOrName(sandboxIdOrName, organization.id)
+
+    const region = await this.regionService.findOne(sourceSandbox.region)
+    if (!region) {
+      throw new NotFoundException(`Region with ID ${sourceSandbox.region} not found`)
+    }
+
+    try {
+      if (sourceSandbox.state !== SandboxState.STARTED) {
+        throw new BadRequestError('Sandbox must be in started state to fork')
+      }
+
+      if (sourceSandbox.pending) {
+        throw new StateChangeInProgressError()
+      }
+
+      if (!sourceSandbox.runnerId) {
+        throw new NotFoundException(`Sandbox with ID ${sourceSandbox.id} does not have a runner`)
+      }
+
+      const runner = await this.runnerService.findOneOrFail(sourceSandbox.runnerId)
+
+      if (runner.runnerClass !== RunnerClass.VM) {
+        throw new HttpException('Forking is not supported for this sandbox', HttpStatus.UNPROCESSABLE_ENTITY)
+      }
+
+      // Copy all properties from source sandbox to forked sandbox
+      const forkedSandbox = new Sandbox(sourceSandbox.region, dto.name)
+      forkedSandbox.organizationId = organization.id
+      forkedSandbox.class = sourceSandbox.class
+      forkedSandbox.snapshot = sourceSandbox.snapshot
+      forkedSandbox.osUser = sourceSandbox.osUser
+      forkedSandbox.env = { ...sourceSandbox.env }
+      forkedSandbox.labels = { ...sourceSandbox.labels }
+      forkedSandbox.cpu = sourceSandbox.cpu
+      forkedSandbox.mem = sourceSandbox.mem
+      forkedSandbox.disk = sourceSandbox.disk
+      forkedSandbox.gpu = sourceSandbox.gpu
+      forkedSandbox.public = sourceSandbox.public
+      forkedSandbox.autoStopInterval = sourceSandbox.autoStopInterval
+      forkedSandbox.autoArchiveInterval = sourceSandbox.autoArchiveInterval
+      forkedSandbox.autoDeleteInterval = sourceSandbox.autoDeleteInterval
+      forkedSandbox.volumes = sourceSandbox.volumes?.map((volume) => ({ ...volume }))
+      forkedSandbox.networkBlockAll = sourceSandbox.networkBlockAll
+      forkedSandbox.networkAllowList = sourceSandbox.networkAllowList
+      forkedSandbox.runnerId = sourceSandbox.runnerId
+      forkedSandbox.pending = true
+      forkedSandbox.state = SandboxState.CREATING
+
+      this.organizationService.assertOrganizationIsNotSuspended(organization)
+
+      // Validate organization usage quotas are not exceeded due to new sandbox created by forking
+      const { pendingCpuIncremented, pendingMemoryIncremented, pendingDiskIncremented } =
+        await this.validateOrganizationQuotas(
+          organization,
+          region,
+          forkedSandbox.cpu,
+          forkedSandbox.mem,
+          forkedSandbox.disk,
+          isEphemeral(forkedSandbox),
+        )
+
+      if (pendingCpuIncremented) {
+        pendingCpuIncrement = forkedSandbox.cpu
+      }
+      if (pendingMemoryIncremented) {
+        pendingMemoryIncrement = forkedSandbox.mem
+      }
+      if (pendingDiskIncremented) {
+        pendingDiskIncrement = forkedSandbox.disk
+      }
+
+      // Capture state of source sandbox before transitioning to FORKING
+      const sourceSandboxInitialState = sourceSandbox.state
+
+      await this.sandboxRepository.updateWhere(sourceSandbox.id, {
+        updateData: {
+          state: SandboxState.FORKING,
+          pending: true,
+        },
+        whereCondition: {
+          state: sourceSandbox.state,
+          pending: false,
+        },
+      })
+
+      let insertedForkedSandbox: Sandbox | undefined
+
+      try {
+        insertedForkedSandbox = await this.sandboxRepository.insert(forkedSandbox, sourceSandbox.id)
+        const runnerAdapter = await this.runnerAdapterFactory.create(runner)
+        await runnerAdapter.forkSandbox(sourceSandbox.id, insertedForkedSandbox.id)
+      } catch (error) {
+        // Rollback source sandbox to its initial state
+        await this.sandboxRepository.updateWhere(sourceSandbox.id, {
+          updateData: {
+            state: sourceSandboxInitialState,
+            pending: false,
+          },
+          whereCondition: { state: SandboxState.FORKING },
+        })
+
+        if (insertedForkedSandbox) {
+          try {
+            const updateData = Sandbox.getSoftDeleteUpdate(insertedForkedSandbox)
+            const destroyedSandbox = await this.sandboxRepository.updateWhere(insertedForkedSandbox.id, {
+              updateData,
+              whereCondition: { pending: true, state: SandboxState.CREATING },
+            })
+            this.eventEmitter.emit(SandboxEvents.DESTROYED, new SandboxDestroyedEvent(destroyedSandbox))
+          } catch (destroyError) {
+            this.logger.error(`Failed to rollback forked sandbox ${insertedForkedSandbox.id}`, destroyError)
+          }
+        }
+
+        throw error
+      }
+
+      this.eventEmitter
+        .emitAsync(SandboxEvents.CREATED, new SandboxCreatedEvent(insertedForkedSandbox))
+        .catch((err) => this.logger.error('Failed to emit SandboxCreatedEvent', err))
+
+      return insertedForkedSandbox
+    } catch (error) {
+      await this.rollbackPendingUsage(
+        organization.id,
+        region.id,
+        pendingCpuIncrement,
+        pendingMemoryIncrement,
+        pendingDiskIncrement,
+      )
+
+      if (error.code === '23505') {
+        throw new ConflictException('Sandbox with this name already exists')
+      }
+
+      throw error
+    }
+  }
+
+  async getForkChildren(
+    organizationId: string,
+    sandboxIdOrName: string,
+    includeDestroyed?: boolean,
+  ): Promise<Sandbox[]> {
+    const sandbox = await this.findOneByIdOrName(sandboxIdOrName, organizationId)
+    const forks = await this.sandboxForkRepository.find({
+      where: {
+        parentId: sandbox.id,
+        child: {
+          organizationId,
+          ...(!includeDestroyed && { state: Not(SandboxState.DESTROYED) }),
+        },
+      },
+      relations: ['child'],
+      take: 100,
+    })
+    return forks.map((f) => f.child)
+  }
+
+  async getForkParent(organizationId: string, sandboxIdOrName: string): Promise<Sandbox | null> {
+    const sandbox = await this.findOneByIdOrName(sandboxIdOrName, organizationId)
+    const fork = await this.sandboxForkRepository.findOne({
+      where: { childId: sandbox.id },
+      relations: ['parent'],
+    })
+    if (!fork || fork.parent.organizationId !== organizationId) {
+      return null
+    }
+    return fork.parent
+  }
+
+  async getForkAncestors(organizationId: string, sandboxIdOrName: string): Promise<Sandbox[]> {
+    const sandbox = await this.findOneByIdOrName(sandboxIdOrName, organizationId)
+    const ancestors: Sandbox[] = []
+    const visitedIds = new Set<string>()
+    let currentId = sandbox.id
+
+    while (ancestors.length < 50) {
+      const fork = await this.sandboxForkRepository.findOne({
+        where: { childId: currentId },
+        relations: ['parent'],
+      })
+      if (!fork || visitedIds.has(fork.parentId) || fork.parent.organizationId !== organizationId) {
+        break
+      }
+      visitedIds.add(fork.parentId)
+      ancestors.push(fork.parent)
+      currentId = fork.parentId
+    }
+
+    return ancestors.reverse()
+  }
+
+  async createSnapshotFromSandbox(
+    sandboxIdOrName: string,
+    organization: Organization,
+    dto: CreateSandboxSnapshotDto,
+  ): Promise<Sandbox> {
+    let pendingSnapshotCountIncrement: number | undefined
+
+    const sandbox = await this.findOneByIdOrName(sandboxIdOrName, organization.id)
+
+    try {
+      if (![SandboxState.STARTED, SandboxState.STOPPED].includes(sandbox.state)) {
+        throw new BadRequestError('Sandbox must be in started or stopped state to create a snapshot')
+      }
+
+      if (sandbox.pending) {
+        throw new StateChangeInProgressError()
+      }
+
+      if (!sandbox.runnerId) {
+        throw new NotFoundException(`Sandbox with ID ${sandbox.id} does not have a runner`)
+      }
+
+      const runner = await this.runnerService.findOneOrFail(sandbox.runnerId)
+
+      if (runner.runnerClass !== RunnerClass.VM) {
+        throw new HttpException('Snapshotting is not supported for this sandbox', HttpStatus.UNPROCESSABLE_ENTITY)
+      }
+
+      this.organizationService.assertOrganizationIsNotSuspended(organization)
+
+      const region = await this.regionService.findOne(sandbox.region)
+      if (!region) {
+        throw new NotFoundException(`Region with ID ${sandbox.region} not found`)
+      }
+
+      const { pendingSnapshotCountIncremented } = await this.snapshotService.validateOrganizationQuotas(
+        organization,
+        region,
+        1,
+        sandbox.cpu,
+        sandbox.mem,
+        sandbox.disk,
+      )
+
+      if (pendingSnapshotCountIncremented) {
+        pendingSnapshotCountIncrement = 1
+      }
+
+      const updatedSandbox = await this.sandboxRepository.updateWhere(sandbox.id, {
+        updateData: {
+          state: SandboxState.SNAPSHOTTING,
+          pending: true,
+        },
+        whereCondition: {
+          state: sandbox.state,
+          pending: false,
+        },
+      })
+
+      try {
+        const registry = sandbox.region
+          ? await this.dockerRegistryService.getAvailableInternalRegistry(sandbox.region)
+          : null
+
+        const runnerAdapter = await this.runnerAdapterFactory.create(runner)
+        await runnerAdapter.createSnapshotFromSandbox(sandbox.id, dto.name, organization.id, registry ?? undefined)
+      } catch (error) {
+        await this.sandboxRepository.updateWhere(sandbox.id, {
+          updateData: {
+            state: sandbox.state,
+            pending: false,
+          },
+          whereCondition: { state: SandboxState.SNAPSHOTTING },
+        })
+
+        throw error
+      }
+
+      return updatedSandbox
+    } catch (error) {
+      await this.snapshotService.rollbackPendingUsage(organization.id, pendingSnapshotCountIncrement)
+      throw error
+    }
   }
 
   async findAllDeprecated(
@@ -802,7 +1131,7 @@ export class SandboxService {
       },
     ]
 
-    return this.sandboxRepository.find({ where })
+    return this.sandboxRepository.find({ where, relations: ['lastActivityAt'] })
   }
 
   async findAll(
@@ -867,7 +1196,11 @@ export class SandboxService {
     baseFindOptions.cpu = createRangeFilter(minCpu, maxCpu)
     baseFindOptions.mem = createRangeFilter(minMemoryGiB, maxMemoryGiB)
     baseFindOptions.disk = createRangeFilter(minDiskGiB, maxDiskGiB)
-    baseFindOptions.updatedAt = createRangeFilter(lastEventAfter, lastEventBefore)
+
+    const lastActivityFilter = createRangeFilter(lastEventAfter, lastEventBefore)
+    if (lastActivityFilter) {
+      baseFindOptions.lastActivityAt = { lastActivityAt: lastActivityFilter }
+    }
 
     const statesToInclude = (states || Object.values(SandboxState)).filter((state) => state !== SandboxState.DESTROYED)
     const errorStates = [SandboxState.ERROR, SandboxState.BUILD_FAILED]
@@ -894,11 +1227,16 @@ export class SandboxService {
 
     const [items, total] = await this.sandboxRepository.findAndCount({
       where,
+      relations: ['lastActivityAt'],
       order: {
-        [sortField]: {
-          direction: sortDirection,
-          nulls: 'LAST',
-        },
+        ...(sortField === SandboxSortField.LAST_ACTIVITY_AT
+          ? { lastActivityAt: { lastActivityAt: { direction: sortDirection, nulls: 'LAST' } } }
+          : {
+              [sortField]: {
+                direction: sortDirection,
+                nulls: 'LAST',
+              },
+            }),
         ...(sortField !== SandboxSortField.CREATED_AT && { createdAt: 'DESC' }),
       },
       skip: (pageNum - 1) * limitNum,
@@ -948,7 +1286,7 @@ export class SandboxService {
       where.state = In(states)
     }
 
-    let sandboxes = await this.sandboxRepository.find({ where })
+    let sandboxes = await this.sandboxRepository.find({ where, relations: ['lastActivityAt'] })
 
     if (skipReconcilingSandboxes) {
       sandboxes = sandboxes.filter((sandbox) => {
@@ -966,7 +1304,7 @@ export class SandboxService {
     returnDestroyed?: boolean,
   ): Promise<Sandbox> {
     const stateFilter = returnDestroyed ? {} : { state: Not(SandboxState.DESTROYED) }
-    const relations: ['buildInfo'] = ['buildInfo']
+    const relations = ['buildInfo', 'lastActivityAt']
 
     // Try lookup by ID first
     let sandbox = await this.sandboxRepository.findOne({
@@ -1016,6 +1354,7 @@ export class SandboxService {
         id: sandboxId,
         ...(returnDestroyed ? {} : { state: Not(SandboxState.DESTROYED) }),
       },
+      relations: ['lastActivityAt'],
     })
 
     if (
@@ -1240,6 +1579,18 @@ export class SandboxService {
       throw new StateChangeInProgressError()
     }
 
+    const forkChildren = await this.sandboxForkRepository.find({
+      where: { parentId: sandbox.id },
+      relations: ['child'],
+    })
+    const activeChildren = forkChildren.filter((f) => f.child && f.child.desiredState !== SandboxDesiredState.DESTROYED)
+    if (activeChildren.length > 0) {
+      throw new HttpException(
+        'Cannot delete sandbox which has active fork children. The forks must be deleted first.',
+        HttpStatus.PRECONDITION_REQUIRED,
+      )
+    }
+
     const updateData = Sandbox.getSoftDeleteUpdate(sandbox)
 
     const updatedSandbox = await this.sandboxRepository.updateWhere(sandbox.id, {
@@ -1291,7 +1642,15 @@ export class SandboxService {
       this.organizationService.assertOrganizationIsNotSuspended(organization)
 
       const { pendingCpuIncremented, pendingMemoryIncremented, pendingDiskIncremented } =
-        await this.validateOrganizationQuotas(organization, region, sandbox.cpu, sandbox.mem, sandbox.disk, sandbox.id)
+        await this.validateOrganizationQuotas(
+          organization,
+          region,
+          sandbox.cpu,
+          sandbox.mem,
+          sandbox.disk,
+          isEphemeral(sandbox),
+          sandbox.id,
+        )
 
       if (pendingCpuIncremented) {
         pendingCpuIncrement = sandbox.cpu
@@ -1348,7 +1707,7 @@ export class SandboxService {
 
     const updateData: Partial<Sandbox> = {
       pending: true,
-      desiredState: sandbox.autoDeleteInterval === 0 ? SandboxDesiredState.DESTROYED : SandboxDesiredState.STOPPED,
+      desiredState: isEphemeral(sandbox) ? SandboxDesiredState.DESTROYED : SandboxDesiredState.STOPPED,
     }
 
     const updatedSandbox = await this.sandboxRepository.updateWhere(sandbox.id, {
@@ -1356,7 +1715,7 @@ export class SandboxService {
       whereCondition: { pending: false, state: sandbox.state },
     })
 
-    if (sandbox.autoDeleteInterval === 0) {
+    if (isEphemeral(sandbox)) {
       this.eventEmitter.emit(SandboxEvents.DESTROYED, new SandboxDestroyedEvent(updatedSandbox))
     } else {
       this.eventEmitter.emit(SandboxEvents.STOPPED, new SandboxStoppedEvent(updatedSandbox, force))
@@ -1482,21 +1841,38 @@ export class SandboxService {
       // Validate organization quotas for the new resource values
       this.organizationService.assertOrganizationIsNotSuspended(organization)
 
-      // Validate per-sandbox quotas with total new values
-      if (newCpu > organization.maxCpuPerSandbox) {
+      const regionQuota = region.enforceQuotas
+        ? await this.organizationService.getRegionQuota(organization.id, region.id)
+        : null
+
+      const { maxCpuPerSandbox, maxMemoryPerSandbox, maxDiskPerSandbox, maxDiskPerNonEphemeralSandbox } =
+        getEffectivePerSandboxLimits(organization, regionQuota)
+
+      if (newCpu > maxCpuPerSandbox) {
         throw new ForbiddenException(
-          `CPU request ${newCpu} exceeds maximum allowed per sandbox (${organization.maxCpuPerSandbox}).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
+          `CPU request ${newCpu} exceeds maximum allowed per sandbox (${maxCpuPerSandbox}).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
         )
       }
-      if (newMem > organization.maxMemoryPerSandbox) {
+      if (newMem > maxMemoryPerSandbox) {
         throw new ForbiddenException(
-          `Memory request ${newMem}GB exceeds maximum allowed per sandbox (${organization.maxMemoryPerSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
+          `Memory request ${newMem}GB exceeds maximum allowed per sandbox (${maxMemoryPerSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
         )
       }
-      if (newDisk > organization.maxDiskPerSandbox) {
+      if (newDisk > maxDiskPerSandbox) {
         throw new ForbiddenException(
-          `Disk request ${newDisk}GB exceeds maximum allowed per sandbox (${organization.maxDiskPerSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
+          `Disk request ${newDisk}GB exceeds maximum allowed per sandbox (${maxDiskPerSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
         )
+      }
+
+      if (!isEphemeral(sandbox) && maxDiskPerNonEphemeralSandbox !== null) {
+        if (maxDiskPerNonEphemeralSandbox === 0) {
+          throw new BadRequestError('Non-ephemeral sandboxes are not permitted in this region')
+        }
+        if (newDisk > maxDiskPerNonEphemeralSandbox) {
+          throw new ForbiddenException(
+            `Disk request ${newDisk}GB exceeds maximum allowed per non-ephemeral sandbox (${maxDiskPerNonEphemeralSandbox}GB).\n${PER_SANDBOX_LIMIT_MESSAGE}`,
+          )
+        }
       }
 
       // For cold resize, cpu/memory don't affect quota until sandbox is STARTED.
@@ -1514,6 +1890,9 @@ export class SandboxService {
             cpuDeltaForQuota,
             memDeltaForQuota,
             diskDeltaForQuota,
+            isEphemeral(sandbox),
+            undefined,
+            regionQuota,
           )
 
         if (pendingCpuIncremented) {
@@ -1793,16 +2172,26 @@ export class SandboxService {
   @LogExecution('cleanup-destroyed-sandboxes')
   @WithInstrumentation()
   async cleanupDestroyedSandboxes() {
-    const twentyFourHoursAgo = new Date()
-    twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24)
+    const lockKey = 'sandbox:cleanup-destroyed-sandboxes'
+    const acquired = await this.redisLockProvider.lock(lockKey, 300)
+    if (!acquired) {
+      return
+    }
 
-    const destroyedSandboxs = await this.sandboxRepository.delete({
-      state: SandboxState.DESTROYED,
-      updatedAt: LessThan(twentyFourHoursAgo),
-    })
+    try {
+      const twentyFourHoursAgo = new Date()
+      twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24)
 
-    if (destroyedSandboxs.affected > 0) {
-      this.logger.debug(`Cleaned up ${destroyedSandboxs.affected} destroyed sandboxes`)
+      const destroyedSandboxs = await this.sandboxRepository.delete({
+        state: SandboxState.DESTROYED,
+        updatedAt: LessThan(twentyFourHoursAgo),
+      })
+
+      if (destroyedSandboxs.affected > 0) {
+        this.logger.debug(`Cleaned up ${destroyedSandboxs.affected} destroyed sandboxes`)
+      }
+    } finally {
+      await this.redisLockProvider.unlock(lockKey)
     }
   }
 
@@ -1810,17 +2199,27 @@ export class SandboxService {
   @LogExecution('cleanup-build-failed-sandboxes')
   @WithInstrumentation()
   async cleanupBuildFailedSandboxes() {
-    const twentyFourHoursAgo = new Date()
-    twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24)
+    const lockKey = 'sandbox:cleanup-build-failed-sandboxes'
+    const acquired = await this.redisLockProvider.lock(lockKey, 300)
+    if (!acquired) {
+      return
+    }
 
-    const destroyedSandboxs = await this.sandboxRepository.delete({
-      state: SandboxState.BUILD_FAILED,
-      desiredState: SandboxDesiredState.DESTROYED,
-      updatedAt: LessThan(twentyFourHoursAgo),
-    })
+    try {
+      const twentyFourHoursAgo = new Date()
+      twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24)
 
-    if (destroyedSandboxs.affected > 0) {
-      this.logger.debug(`Cleaned up ${destroyedSandboxs.affected} build failed sandboxes`)
+      const destroyedSandboxs = await this.sandboxRepository.delete({
+        state: SandboxState.BUILD_FAILED,
+        desiredState: SandboxDesiredState.DESTROYED,
+        updatedAt: LessThan(twentyFourHoursAgo),
+      })
+
+      if (destroyedSandboxs.affected > 0) {
+        this.logger.debug(`Cleaned up ${destroyedSandboxs.affected} build failed sandboxes`)
+      }
+    } finally {
+      await this.redisLockProvider.unlock(lockKey)
     }
   }
 
@@ -1828,17 +2227,27 @@ export class SandboxService {
   @LogExecution('cleanup-stale-build-failed-sandboxes')
   @WithInstrumentation()
   async cleanupStaleBuildFailedSandboxes() {
-    const sevenDaysAgo = new Date()
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+    const lockKey = 'sandbox:cleanup-stale-build-failed-sandboxes'
+    const acquired = await this.redisLockProvider.lock(lockKey, 300)
+    if (!acquired) {
+      return
+    }
 
-    const result = await this.sandboxRepository.delete({
-      state: SandboxState.BUILD_FAILED,
-      desiredState: SandboxDesiredState.STARTED,
-      updatedAt: LessThan(sevenDaysAgo),
-    })
+    try {
+      const sevenDaysAgo = new Date()
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
 
-    if (result.affected > 0) {
-      this.logger.debug(`Cleaned up ${result.affected} stale build failed sandboxes`)
+      const result = await this.sandboxRepository.delete({
+        state: SandboxState.BUILD_FAILED,
+        desiredState: SandboxDesiredState.STARTED,
+        updatedAt: LessThan(sevenDaysAgo),
+      })
+
+      if (result.affected > 0) {
+        this.logger.debug(`Cleaned up ${result.affected} stale build failed sandboxes`)
+      }
+    } finally {
+      await this.redisLockProvider.unlock(lockKey)
     }
   }
 
@@ -1846,17 +2255,27 @@ export class SandboxService {
   @LogExecution('cleanup-stale-error-sandboxes')
   @WithInstrumentation()
   async cleanupStaleErrorSandboxes() {
-    const sevenDaysAgo = new Date()
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+    const lockKey = 'sandbox:cleanup-stale-error-sandboxes'
+    const acquired = await this.redisLockProvider.lock(lockKey, 300)
+    if (!acquired) {
+      return
+    }
 
-    const result = await this.sandboxRepository.delete({
-      state: SandboxState.ERROR,
-      desiredState: SandboxDesiredState.DESTROYED,
-      updatedAt: LessThan(sevenDaysAgo),
-    })
+    try {
+      const sevenDaysAgo = new Date()
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
 
-    if (result.affected > 0) {
-      this.logger.debug(`Cleaned up ${result.affected} stale error sandboxes`)
+      const result = await this.sandboxRepository.delete({
+        state: SandboxState.ERROR,
+        desiredState: SandboxDesiredState.DESTROYED,
+        updatedAt: LessThan(sevenDaysAgo),
+      })
+
+      if (result.affected > 0) {
+        this.logger.debug(`Cleaned up ${result.affected} stale error sandboxes`)
+      }
+    } finally {
+      await this.redisLockProvider.unlock(lockKey)
     }
   }
 
@@ -1899,25 +2318,48 @@ export class SandboxService {
     const sandbox = await this.findOneByIdOrName(sandboxIdOrName, organizationId)
 
     const updateData: Partial<Sandbox> = {}
+    let effectiveNetworkBlockAll = sandbox.networkBlockAll
+    let effectiveNetworkAllowList = sandbox.networkAllowList
 
     if (networkBlockAll !== undefined) {
       updateData.networkBlockAll = networkBlockAll
+      effectiveNetworkBlockAll = networkBlockAll
+      if (networkBlockAll === true) {
+        updateData.networkAllowList = null
+        effectiveNetworkAllowList = null
+      }
     }
 
     if (networkAllowList !== undefined) {
-      updateData.networkAllowList = this.resolveNetworkAllowList(networkAllowList)
+      if (networkAllowList.trim() === '') {
+        updateData.networkAllowList = null
+        effectiveNetworkAllowList = null
+      } else {
+        const resolvedNetworkAllowList = this.resolveNetworkAllowList(networkAllowList)
+        updateData.networkAllowList = resolvedNetworkAllowList
+        updateData.networkBlockAll = false
+        effectiveNetworkAllowList = resolvedNetworkAllowList
+        effectiveNetworkBlockAll = false
+      }
+    } else if (networkBlockAll === false) {
+      updateData.networkAllowList = null
+      effectiveNetworkAllowList = null
     }
-
-    const updatedSandbox = await this.sandboxRepository.update(sandbox.id, { updateData, entity: sandbox })
 
     // Update network settings on the runner
     if (sandbox.runnerId) {
       const runner = await this.runnerService.findOne(sandbox.runnerId)
       if (runner) {
         const runnerAdapter = await this.runnerAdapterFactory.create(runner)
-        await runnerAdapter.updateNetworkSettings(sandbox.id, networkBlockAll, networkAllowList)
+        await runnerAdapter.updateNetworkSettings(
+          sandbox.id,
+          effectiveNetworkBlockAll,
+          effectiveNetworkAllowList ?? undefined,
+        )
       }
     }
+
+    const updatedSandbox = await this.sandboxRepository.update(sandbox.id, { updateData, entity: sandbox })
 
     return updatedSandbox
   }

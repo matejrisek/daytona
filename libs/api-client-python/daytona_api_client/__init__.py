@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from daytona_api_client.models.create_runner import CreateRunner
     from daytona_api_client.models.create_runner_response import CreateRunnerResponse
     from daytona_api_client.models.create_sandbox import CreateSandbox
+    from daytona_api_client.models.create_sandbox_snapshot import CreateSandboxSnapshot
     from daytona_api_client.models.create_session_request import CreateSessionRequest
     from daytona_api_client.models.create_snapshot import CreateSnapshot
     from daytona_api_client.models.create_user import CreateUser
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
     from daytona_api_client.models.execute_response import ExecuteResponse
     from daytona_api_client.models.file_info import FileInfo
     from daytona_api_client.models.file_status import FileStatus
+    from daytona_api_client.models.fork_sandbox import ForkSandbox
     from daytona_api_client.models.git_add_request import GitAddRequest
     from daytona_api_client.models.git_branch_request import GitBranchRequest
     from daytona_api_client.models.git_checkout_request import GitCheckoutRequest
@@ -179,6 +181,7 @@ if TYPE_CHECKING:
     from daytona_api_client.models.replace_result import ReplaceResult
     from daytona_api_client.models.resize_sandbox import ResizeSandbox
     from daytona_api_client.models.runner import Runner
+    from daytona_api_client.models.runner_class import RunnerClass
     from daytona_api_client.models.runner_full import RunnerFull
     from daytona_api_client.models.runner_health_metrics import RunnerHealthMetrics
     from daytona_api_client.models.runner_healthcheck import RunnerHealthcheck
@@ -218,6 +221,7 @@ if TYPE_CHECKING:
     from daytona_api_client.models.update_organization_region_quota import UpdateOrganizationRegionQuota
     from daytona_api_client.models.update_organization_role import UpdateOrganizationRole
     from daytona_api_client.models.update_region import UpdateRegion
+    from daytona_api_client.models.update_sandbox_network_settings import UpdateSandboxNetworkSettings
     from daytona_api_client.models.update_sandbox_state_dto import UpdateSandboxStateDto
     from daytona_api_client.models.url import Url
     from daytona_api_client.models.user import User
@@ -294,6 +298,7 @@ _DYNAMIC_IMPORTS: dict[str, str] = {
     "CreateRunner": "daytona_api_client.models.create_runner",
     "CreateRunnerResponse": "daytona_api_client.models.create_runner_response",
     "CreateSandbox": "daytona_api_client.models.create_sandbox",
+    "CreateSandboxSnapshot": "daytona_api_client.models.create_sandbox_snapshot",
     "CreateSessionRequest": "daytona_api_client.models.create_session_request",
     "CreateSnapshot": "daytona_api_client.models.create_snapshot",
     "CreateUser": "daytona_api_client.models.create_user",
@@ -307,6 +312,7 @@ _DYNAMIC_IMPORTS: dict[str, str] = {
     "ExecuteResponse": "daytona_api_client.models.execute_response",
     "FileInfo": "daytona_api_client.models.file_info",
     "FileStatus": "daytona_api_client.models.file_status",
+    "ForkSandbox": "daytona_api_client.models.fork_sandbox",
     "GitAddRequest": "daytona_api_client.models.git_add_request",
     "GitBranchRequest": "daytona_api_client.models.git_branch_request",
     "GitCheckoutRequest": "daytona_api_client.models.git_checkout_request",
@@ -389,6 +395,7 @@ _DYNAMIC_IMPORTS: dict[str, str] = {
     "ReplaceResult": "daytona_api_client.models.replace_result",
     "ResizeSandbox": "daytona_api_client.models.resize_sandbox",
     "Runner": "daytona_api_client.models.runner",
+    "RunnerClass": "daytona_api_client.models.runner_class",
     "RunnerFull": "daytona_api_client.models.runner_full",
     "RunnerHealthMetrics": "daytona_api_client.models.runner_health_metrics",
     "RunnerHealthcheck": "daytona_api_client.models.runner_healthcheck",
@@ -428,6 +435,7 @@ _DYNAMIC_IMPORTS: dict[str, str] = {
     "UpdateOrganizationRegionQuota": "daytona_api_client.models.update_organization_region_quota",
     "UpdateOrganizationRole": "daytona_api_client.models.update_organization_role",
     "UpdateRegion": "daytona_api_client.models.update_region",
+    "UpdateSandboxNetworkSettings": "daytona_api_client.models.update_sandbox_network_settings",
     "UpdateSandboxStateDto": "daytona_api_client.models.update_sandbox_state_dto",
     "Url": "daytona_api_client.models.url",
     "User": "daytona_api_client.models.user",
@@ -518,6 +526,7 @@ __all__ = [
     "CreateRunner",
     "CreateRunnerResponse",
     "CreateSandbox",
+    "CreateSandboxSnapshot",
     "CreateSessionRequest",
     "CreateSnapshot",
     "CreateUser",
@@ -531,6 +540,7 @@ __all__ = [
     "ExecuteResponse",
     "FileInfo",
     "FileStatus",
+    "ForkSandbox",
     "GitAddRequest",
     "GitBranchRequest",
     "GitCheckoutRequest",
@@ -613,6 +623,7 @@ __all__ = [
     "ReplaceResult",
     "ResizeSandbox",
     "Runner",
+    "RunnerClass",
     "RunnerFull",
     "RunnerHealthMetrics",
     "RunnerHealthcheck",
@@ -652,6 +663,7 @@ __all__ = [
     "UpdateOrganizationRegionQuota",
     "UpdateOrganizationRole",
     "UpdateRegion",
+    "UpdateSandboxNetworkSettings",
     "UpdateSandboxStateDto",
     "Url",
     "User",

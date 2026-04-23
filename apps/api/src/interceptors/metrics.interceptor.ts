@@ -32,6 +32,8 @@ import { UpdateOrganizationRoleDto } from '../organization/dto/update-organizati
 import { CreateOrganizationInvitationDto } from '../organization/dto/create-organization-invitation.dto'
 import { UpdateOrganizationInvitationDto } from '../organization/dto/update-organization-invitation.dto'
 import { CustomHeaders } from '../common/constants/header.constants'
+import { CreateSandboxSnapshotDto } from '../sandbox/dto/create-sandbox-snapshot.dto'
+import { ForkSandboxDto } from '../sandbox/dto/fork-sandbox.dto'
 import { CreateVolumeDto } from '../sandbox/dto/create-volume.dto'
 import { VolumeDto } from '../sandbox/dto/volume.dto'
 import { CreateWorkspaceDto } from '../sandbox/dto/create-workspace.deprecated.dto'
@@ -186,6 +188,12 @@ export class MetricsInterceptor implements NestInterceptor, OnApplicationShutdow
             break
           case '/api/sandbox/:sandboxIdOrName/backup':
             this.captureCreateBackup(props, request.params.sandboxIdOrName)
+            break
+          case '/api/sandbox/:sandboxIdOrName/snapshot':
+            this.captureCreateSandboxSnapshot(props, request.params.sandboxIdOrName, request.body, response)
+            break
+          case '/api/sandbox/:sandboxIdOrName/fork':
+            this.captureForkSandbox(props, request.params.sandboxIdOrName, request.body, response)
             break
           case '/api/sandbox/:sandboxIdOrName/public/:isPublic':
           case '/api/workspace/:workspaceId/public/:isPublic':
@@ -660,6 +668,32 @@ export class MetricsInterceptor implements NestInterceptor, OnApplicationShutdow
     })
   }
 
+  private captureCreateSandboxSnapshot(
+    props: CommonCaptureProps,
+    sandboxId: string,
+    request: CreateSandboxSnapshotDto,
+    response: SandboxDto,
+  ) {
+    this.capture('api_sandbox_snapshot_created', props, 'api_sandbox_snapshot_creation_failed', {
+      sandbox_id: sandboxId,
+      snapshot_name: request.name,
+      result_sandbox_id: response.id,
+    })
+  }
+
+  private captureForkSandbox(
+    props: CommonCaptureProps,
+    sandboxId: string,
+    request: ForkSandboxDto,
+    response: SandboxDto,
+  ) {
+    this.capture('api_sandbox_forked', props, 'api_sandbox_fork_failed', {
+      sandbox_id: sandboxId,
+      fork_name: request.name,
+      forked_sandbox_id: response.id,
+    })
+  }
+
   private captureUpdatePublicStatus(props: CommonCaptureProps, sandboxId: string, isPublic: boolean) {
     this.capture('api_sandbox_public_status_updated', props, 'api_sandbox_public_status_update_failed', {
       sandbox_id: sandboxId,
@@ -779,6 +813,12 @@ export class MetricsInterceptor implements NestInterceptor, OnApplicationShutdow
       organization_region_total_cpu_quota: request.totalCpuQuota,
       organization_region_total_memory_quota_mb: request.totalMemoryQuota ? request.totalMemoryQuota * 1024 : null,
       organization_region_total_disk_quota_gb: request.totalDiskQuota,
+      organization_region_max_cpu_per_sandbox: request.maxCpuPerSandbox,
+      organization_region_max_memory_per_sandbox_mb: request.maxMemoryPerSandbox
+        ? request.maxMemoryPerSandbox * 1024
+        : null,
+      organization_region_max_disk_per_sandbox_gb: request.maxDiskPerSandbox,
+      organization_region_max_disk_per_non_ephemeral_sandbox_gb: request.maxDiskPerNonEphemeralSandbox,
     })
   }
 

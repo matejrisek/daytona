@@ -7,7 +7,7 @@ import asyncio
 from deprecated import deprecated
 from pydantic import ConfigDict, PrivateAttr
 
-from daytona_api_client_async import BuildInfo
+from daytona_api_client_async import BuildInfo, CreateSandboxSnapshot, ForkSandbox
 from daytona_api_client_async import PaginatedSandboxes as PaginatedSandboxesDto
 from daytona_api_client_async import PortPreviewUrl, ResizeSandbox
 from daytona_api_client_async import Sandbox as SandboxDto
@@ -19,6 +19,7 @@ from daytona_api_client_async import (
     SignedPortPreviewUrl,
     SshAccessDto,
     SshAccessValidationDto,
+    UpdateSandboxNetworkSettings,
 )
 from daytona_toolbox_api_client_async import (
     ApiClient,
@@ -34,9 +35,9 @@ from daytona_toolbox_api_client_async import (
 from .._utils.errors import intercept_errors
 from .._utils.otel_decorator import with_instrumentation
 from .._utils.timeout import http_timeout, with_timeout
+from ..common.daytona import CODE_TOOLBOX_LANGUAGE_LABEL
 from ..common.errors import DaytonaError, DaytonaNotFoundError, DaytonaValidationError
 from ..common.lsp_server import LspLanguageId, LspLanguageIdLiteral
-from ..common.protocols import SandboxCodeToolbox
 from ..common.sandbox import Resources
 from ..internal.pool_tracker import AsyncPoolSaturationTracker
 from ..internal.toolbox_api_client_proxy import ToolboxApiClientProxy
@@ -83,6 +84,7 @@ class AsyncSandbox(SandboxDto):
         build_info (str): Build information for the Sandbox if it was created from dynamic build.
         created_at (str): When the Sandbox was created.
         updated_at (str): When the Sandbox was last updated.
+        last_activity_at (str): When the Sandbox last had activity.
         network_block_all (bool): Whether to block all network access for the Sandbox.
         network_allow_list (str): Comma-separated list of allowed CIDR network addresses for the Sandbox.
     """
@@ -101,8 +103,9 @@ class AsyncSandbox(SandboxDto):
         sandbox_dto: SandboxDto,
         toolbox_api: ApiClient,
         sandbox_api: SandboxApi,
-        code_toolbox: SandboxCodeToolbox,
+        language: str,
         pool_tracker: AsyncPoolSaturationTracker | None = None,
+        ws_handshake_semaphore: asyncio.Semaphore | None = None,
     ):
         """Initialize a new Sandbox instance.
 
@@ -110,13 +113,12 @@ class AsyncSandbox(SandboxDto):
             sandbox_dto (SandboxDto): The sandbox data from the API.
             toolbox_api (ApiClient): API client for toolbox operations.
             sandbox_api (SandboxApi): API client for Sandbox operations.
-            code_toolbox (SandboxCodeToolbox): Language-specific toolbox implementation.
+            language (str): Language code for the Sandbox code_run.
             pool_tracker (AsyncPoolSaturationTracker | None): Tracker for connection pool saturation.
         """
         super().__init__(**sandbox_dto.model_dump())
         self.__process_sandbox_dto(sandbox_dto)
         self._sandbox_api: SandboxApi = sandbox_api
-        self._code_toolbox: SandboxCodeToolbox = code_toolbox
         # Wrap the toolbox API client to inject the sandbox ID into the resource path
         self._toolbox_api: ToolboxApiClientProxy[ApiClient] = ToolboxApiClientProxy(
             toolbox_api, self.id, self.toolbox_proxy_url, pool_tracker
@@ -124,9 +126,9 @@ class AsyncSandbox(SandboxDto):
 
         self._fs = AsyncFileSystem(FileSystemApi(self._toolbox_api))
         self._git = AsyncGit(GitApi(self._toolbox_api))
-        self._process = AsyncProcess(code_toolbox, ProcessApi(self._toolbox_api))
+        self._process = AsyncProcess(language, ProcessApi(self._toolbox_api), ws_handshake_semaphore)
         self._computer_use = AsyncComputerUse(ComputerUseApi(self._toolbox_api))
-        self._code_interpreter = AsyncCodeInterpreter(InterpreterApi(self._toolbox_api))
+        self._code_interpreter = AsyncCodeInterpreter(InterpreterApi(self._toolbox_api), ws_handshake_semaphore)
         self._info_api: InfoApi = InfoApi(self._toolbox_api)
 
     @property
@@ -505,6 +507,41 @@ class AsyncSandbox(SandboxDto):
         _ = await self._sandbox_api.set_auto_delete_interval(self.id, interval)
         self.auto_delete_interval = interval
 
+    @intercept_errors(message_prefix="Failed to update network settings: ")
+    @with_instrumentation()
+    async def update_network_settings(
+        self,
+        *,
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
+    ) -> None:
+        """Updates outbound network policy on the runner (block all, restore access, or CIDR allow list).
+
+        Args:
+            network_block_all: When ``True``, blocks all outbound traffic. When ``False``, restores general
+                outbound access (and clears a stored allow list).
+            network_allow_list: Comma-separated IPv4 CIDRs to allow; implies not blocking all.
+
+        Raises:
+            DaytonaValidationError: If neither argument is set.
+
+        Example:
+            ```python
+            await sandbox.update_network_settings(network_block_all=True)
+            await sandbox.update_network_settings(network_block_all=False)
+            ```
+        """
+        if network_block_all is None and network_allow_list is None:
+            raise DaytonaValidationError("At least one of network_block_all or network_allow_list must be set")
+
+        body = UpdateSandboxNetworkSettings(
+            network_block_all=network_block_all,
+            network_allow_list=network_allow_list,
+        )
+        updated = await self._sandbox_api.update_network_settings(self.id, body)
+        self.network_block_all = updated.network_block_all
+        self.network_allow_list = updated.network_allow_list
+
     @intercept_errors(message_prefix="Failed to get preview link: ")
     @with_instrumentation()
     async def get_preview_link(self, port: int) -> PortPreviewUrl:
@@ -629,12 +666,12 @@ class AsyncSandbox(SandboxDto):
         while self.state == "resizing":
             await self.refresh_data()
 
-            if self.state != "resizing":
-                return
-
             if self.state in ["error", "build_failed"]:
                 err_msg = f"Sandbox {self.id} resize failed with state: {self.state}, error reason: {self.error_reason}"
                 raise DaytonaError(err_msg)
+
+            if self.state != "resizing":
+                return
 
             await asyncio.sleep(check_interval)
             if asyncio.get_event_loop().time() - start_time > 5:
@@ -684,6 +721,97 @@ class AsyncSandbox(SandboxDto):
         """
         await self._sandbox_api.update_last_activity(self.id)
 
+    @intercept_errors(message_prefix="Failed to fork sandbox: ")
+    @with_timeout()
+    @with_instrumentation()
+    async def _experimental_fork(self, name: str | None = None, timeout: float | None = 60) -> "AsyncSandbox":
+        """Forks the Sandbox, creating a new Sandbox with an identical filesystem.
+
+        The forked Sandbox is a copy-on-write clone of the original. It starts
+        with the same disk contents but operates independently from that point on.
+
+        Args:
+            name (str | None): Optional name for the forked Sandbox. If not provided, a unique name will be generated.
+            timeout (float | None): Maximum time to wait in seconds. 0 means no timeout. Default is 60 seconds.
+
+        Returns:
+            AsyncSandbox: The forked Sandbox.
+
+        Raises:
+            DaytonaError: If the fork operation fails or times out.
+
+        Example:
+            ```python
+            sandbox = await daytona.get("my-sandbox")
+            forked = await sandbox._experimental_fork(name="my-fork")
+            print(f"Forked sandbox: {forked.id}")
+            ```
+        """
+        sandbox_dto = await self._sandbox_api.fork_sandbox(
+            self.id, ForkSandbox(name=name), _request_timeout=http_timeout(timeout)
+        )
+
+        language = sandbox_dto.labels.get(CODE_TOOLBOX_LANGUAGE_LABEL) or ""
+
+        forked = AsyncSandbox(
+            sandbox_dto,
+            self._toolbox_api._api_client,
+            self._sandbox_api,
+            language,
+            ws_handshake_semaphore=self._process._ws_handshake_semaphore,
+        )
+        await forked.wait_for_sandbox_start(timeout=0)
+        return forked
+
+    @intercept_errors(message_prefix="Failed to create snapshot: ")
+    @with_timeout()
+    @with_instrumentation()
+    async def _experimental_create_snapshot(self, name: str, timeout: float | None = 60) -> None:
+        """Creates a snapshot from the current state of the Sandbox.
+
+        This captures the Sandbox's filesystem into a reusable snapshot that can be
+        used to create new Sandboxes. The Sandbox will temporarily enter a
+        'snapshotting' state and return to its previous state when complete.
+
+        Args:
+            name (str): Name for the new snapshot.
+            timeout (float | None): Maximum time to wait in seconds. 0 means no timeout. Default is 60 seconds.
+
+        Raises:
+            DaytonaError: If the snapshot operation fails or times out.
+
+        Example:
+            ```python
+            sandbox = await daytona.get("my-sandbox")
+            await sandbox._experimental_create_snapshot("my-snapshot")
+            print("Snapshot created successfully")
+            ```
+        """
+        _ = await self._sandbox_api.create_sandbox_snapshot(
+            self.id, CreateSandboxSnapshot(name=name), _request_timeout=http_timeout(timeout)
+        )
+        await self.refresh_data()
+        await self.__wait_for_snapshot_complete()
+
+    async def __wait_for_snapshot_complete(self) -> None:
+        check_interval = 0.1
+        start_time = asyncio.get_event_loop().time()
+
+        while self.state == "snapshotting":
+            await self.refresh_data()
+
+            if self.state in ["error", "build_failed"]:
+                raise DaytonaError(
+                    f"Sandbox {self.id} snapshot failed with state: {self.state}, error reason: {self.error_reason}"
+                )
+
+            if self.state != "snapshotting":
+                return
+
+            await asyncio.sleep(check_interval)
+            if asyncio.get_event_loop().time() - start_time > 5:
+                check_interval = min(check_interval * 1.1, 1.0)
+
     def __process_sandbox_dto(self, sandbox_dto: SandboxDto) -> None:
         self.id: str = sandbox_dto.id
         self.name: str = sandbox_dto.name
@@ -710,6 +838,7 @@ class AsyncSandbox(SandboxDto):
         self.build_info: BuildInfo | None = sandbox_dto.build_info
         self.created_at: str | None = sandbox_dto.created_at
         self.updated_at: str | None = sandbox_dto.updated_at
+        self.last_activity_at: str | None = sandbox_dto.last_activity_at
         self.network_block_all: bool = sandbox_dto.network_block_all
         self.network_allow_list: str | None = sandbox_dto.network_allow_list
         self.toolbox_proxy_url: str = sandbox_dto.toolbox_proxy_url

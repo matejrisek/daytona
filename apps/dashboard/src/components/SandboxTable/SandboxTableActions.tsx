@@ -3,8 +3,11 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
+import { FeatureFlags } from '@/enums/FeatureFlags'
 import { RoutePath } from '@/enums/RoutePath'
+import { useRegions } from '@/hooks/useRegions'
 import { SandboxState } from '@daytona/api-client'
+import { useFeatureFlagEnabled } from 'posthog-js/react'
 import { Terminal, MoreVertical, Play, Square, Loader2, Wrench } from 'lucide-react'
 import { generatePath, useNavigate } from 'react-router-dom'
 import { Button } from '../ui/button'
@@ -23,6 +26,7 @@ export function SandboxTableActions({
   writePermitted,
   deletePermitted,
   isLoading,
+  runnerClass,
   onStart,
   onStop,
   onDelete,
@@ -31,10 +35,16 @@ export function SandboxTableActions({
   onOpenWebTerminal,
   onCreateSshAccess,
   onRevokeSshAccess,
+  onCreateSnapshot,
   onRecover,
   onScreenRecordings,
+  onFork,
+  onViewForks,
 }: SandboxTableActionsProps) {
   const navigate = useNavigate()
+  const linuxVmEnabled = useFeatureFlagEnabled(FeatureFlags.SANDBOX_LINUX_VM)
+  const { getRegionName } = useRegions()
+  const isExperimentalRegion = (getRegionName(sandbox.target) ?? '').toLowerCase() === 'experimental'
 
   const menuItems = useMemo(() => {
     const items = []
@@ -91,6 +101,35 @@ export function SandboxTableActions({
         })
       }
 
+      if (
+        linuxVmEnabled &&
+        isExperimentalRegion &&
+        (sandbox.state === SandboxState.STARTED || sandbox.state === SandboxState.STOPPED)
+      ) {
+        items.push({
+          key: 'create-snapshot',
+          label: 'Create Snapshot',
+          onClick: () => onCreateSnapshot?.(),
+          disabled: isLoading,
+        })
+
+        items.push({
+          key: 'fork',
+          label: 'Fork',
+          onClick: () => onFork?.(),
+          disabled: isLoading,
+        })
+      }
+
+      if (linuxVmEnabled && isExperimentalRegion) {
+        items.push({
+          key: 'view-forks',
+          label: 'View Fork Tree',
+          onClick: () => onViewForks?.(),
+          disabled: isLoading,
+        })
+      }
+
       // Add SSH access options
       items.push({
         key: 'create-ssh',
@@ -127,6 +166,7 @@ export function SandboxTableActions({
     sandbox.state,
     sandbox.id,
     isLoading,
+    runnerClass,
     sandbox.recoverable,
     onStart,
     onStop,
@@ -135,8 +175,14 @@ export function SandboxTableActions({
     onVnc,
     onCreateSshAccess,
     onRevokeSshAccess,
+    onCreateSnapshot,
     onRecover,
     onScreenRecordings,
+    onFork,
+    onViewForks,
+    linuxVmEnabled,
+    isExperimentalRegion,
+    sandbox.target,
     navigate,
   ])
 

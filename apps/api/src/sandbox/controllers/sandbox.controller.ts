@@ -67,9 +67,11 @@ import { SandboxStateUpdatedEvent } from '../events/sandbox-state-updated.event'
 import { Audit, MASKED_AUDIT_VALUE, TypedRequest } from '../../audit/decorators/audit.decorator'
 import { AuditAction } from '../../audit/enums/audit-action.enum'
 import { AuditTarget } from '../../audit/enums/audit-target.enum'
-// import { UpdateSandboxNetworkSettingsDto } from '../dto/update-sandbox-network-settings.dto'
+import { UpdateSandboxNetworkSettingsDto } from '../dto/update-sandbox-network-settings.dto'
 import { SshAccessDto, SshAccessValidationDto } from '../dto/ssh-access.dto'
 import { ListSandboxesQueryDto } from '../dto/list-sandboxes-query.dto'
+import { CreateSandboxSnapshotDto } from '../dto/create-sandbox-snapshot.dto'
+import { ForkSandboxDto } from '../dto/fork-sandbox.dto'
 import { ProxyAuthContextGuard } from '../guards/proxy-auth-context.guard'
 import { OrGuard } from '../../auth/or.guard'
 import { AuthenticatedRateLimitGuard } from '../../common/guards/authenticated-rate-limit.guard'
@@ -699,6 +701,136 @@ export class SandboxController {
     return this.sandboxService.toSandboxDto(sandbox)
   }
 
+  @Post(':sandboxIdOrName/snapshot')
+  @HttpCode(200)
+  @RequireFlagsEnabled({ flags: [{ flagKey: FeatureFlags.SANDBOX_LINUX_VM, defaultValue: false }] })
+  @ApiOperation({
+    summary: 'Create a snapshot from a sandbox',
+    operationId: 'createSandboxSnapshot',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Snapshot creation has been initiated',
+    type: SandboxDto,
+  })
+  @UseGuards(OrganizationAuthContextGuard, SandboxAccessGuard)
+  @RequiredOrganizationResourcePermissions([OrganizationResourcePermission.WRITE_SANDBOXES])
+  @Audit({
+    action: AuditAction.SNAPSHOT,
+    targetType: AuditTarget.SANDBOX,
+    targetIdFromRequest: (req) => req.params.sandboxIdOrName,
+    targetIdFromResult: (result: SandboxDto) => result?.id,
+    requestMetadata: {
+      body: (req: TypedRequest<CreateSandboxSnapshotDto>) => ({
+        name: req.body?.name,
+      }),
+    },
+  })
+  async createSandboxSnapshot(
+    @IsOrganizationAuthContext() authContext: OrganizationAuthContext,
+    @Param('sandboxIdOrName') sandboxIdOrName: string,
+    @Body() dto: CreateSandboxSnapshotDto,
+  ): Promise<SandboxDto> {
+    const sandbox = await this.sandboxService.createSnapshotFromSandbox(sandboxIdOrName, authContext.organization, dto)
+    return this.sandboxService.toSandboxDto(sandbox)
+  }
+
+  @Post(':sandboxIdOrName/fork')
+  @HttpCode(200)
+  @SkipThrottle({ authenticated: true })
+  @ThrottlerScope('sandbox-create')
+  @RequireFlagsEnabled({ flags: [{ flagKey: FeatureFlags.SANDBOX_LINUX_VM, defaultValue: false }] })
+  @ApiOperation({
+    summary: 'Fork a sandbox',
+    operationId: 'forkSandbox',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Fork operation has been initiated',
+    type: SandboxDto,
+  })
+  @UseGuards(OrganizationAuthContextGuard, SandboxAccessGuard)
+  @RequiredOrganizationResourcePermissions([OrganizationResourcePermission.WRITE_SANDBOXES])
+  @Audit({
+    action: AuditAction.FORK,
+    targetType: AuditTarget.SANDBOX,
+    targetIdFromRequest: (req) => req.params.sandboxIdOrName,
+    targetIdFromResult: (result: SandboxDto) => result?.id,
+    requestMetadata: {
+      body: (req: TypedRequest<ForkSandboxDto>) => ({
+        name: req.body?.name,
+      }),
+    },
+  })
+  async forkSandbox(
+    @IsOrganizationAuthContext() authContext: OrganizationAuthContext,
+    @Param('sandboxIdOrName') sandboxIdOrName: string,
+    @Body() dto: ForkSandboxDto,
+  ): Promise<SandboxDto> {
+    const sandbox = await this.sandboxService.forkSandbox(sandboxIdOrName, authContext.organization, dto)
+    return this.sandboxService.toSandboxDto(sandbox)
+  }
+
+  @Get(':sandboxIdOrName/forks')
+  @RequireFlagsEnabled({ flags: [{ flagKey: FeatureFlags.SANDBOX_LINUX_VM, defaultValue: false }] })
+  @ApiOperation({
+    summary: 'Get sandbox fork children',
+    operationId: 'getSandboxForks',
+  })
+  @ApiParam({ name: 'sandboxIdOrName', type: String })
+  @ApiQuery({ name: 'includeDestroyed', required: false, type: Boolean })
+  @ApiResponse({ status: 200, type: [SandboxDto] })
+  @UseGuards(OrganizationAuthContextGuard, SandboxAccessGuard)
+  async getSandboxForks(
+    @IsOrganizationAuthContext() authContext: OrganizationAuthContext,
+    @Param('sandboxIdOrName') sandboxIdOrName: string,
+    @Query('includeDestroyed') includeDestroyed?: boolean,
+  ): Promise<SandboxDto[]> {
+    const children = await this.sandboxService.getForkChildren(
+      authContext.organizationId,
+      sandboxIdOrName,
+      includeDestroyed,
+    )
+    return this.sandboxService.toSandboxDtos(children)
+  }
+
+  @Get(':sandboxIdOrName/parent')
+  @RequireFlagsEnabled({ flags: [{ flagKey: FeatureFlags.SANDBOX_LINUX_VM, defaultValue: false }] })
+  @ApiOperation({
+    summary: 'Get sandbox fork parent',
+    operationId: 'getSandboxParent',
+  })
+  @ApiParam({ name: 'sandboxIdOrName', type: String })
+  @ApiResponse({ status: 200, type: SandboxDto })
+  @UseGuards(OrganizationAuthContextGuard, SandboxAccessGuard)
+  async getSandboxParent(
+    @IsOrganizationAuthContext() authContext: OrganizationAuthContext,
+    @Param('sandboxIdOrName') sandboxIdOrName: string,
+  ): Promise<SandboxDto> {
+    const parent = await this.sandboxService.getForkParent(authContext.organizationId, sandboxIdOrName)
+    if (!parent) {
+      throw new NotFoundException(`Parent sandbox not found for sandbox ${sandboxIdOrName}`)
+    }
+    return this.sandboxService.toSandboxDto(parent)
+  }
+
+  @Get(':sandboxIdOrName/ancestors')
+  @RequireFlagsEnabled({ flags: [{ flagKey: FeatureFlags.SANDBOX_LINUX_VM, defaultValue: false }] })
+  @ApiOperation({
+    summary: 'Get sandbox fork ancestor chain',
+    operationId: 'getSandboxAncestors',
+  })
+  @ApiParam({ name: 'sandboxIdOrName', type: String })
+  @ApiResponse({ status: 200, type: [SandboxDto] })
+  @UseGuards(OrganizationAuthContextGuard, SandboxAccessGuard)
+  async getSandboxAncestors(
+    @IsOrganizationAuthContext() authContext: OrganizationAuthContext,
+    @Param('sandboxIdOrName') sandboxIdOrName: string,
+  ): Promise<SandboxDto[]> {
+    const ancestors = await this.sandboxService.getForkAncestors(authContext.organizationId, sandboxIdOrName)
+    return this.sandboxService.toSandboxDtos(ancestors)
+  }
+
   @Post(':sandboxIdOrName/public/:isPublic')
   @ApiOperation({
     summary: 'Update public status',
@@ -898,49 +1030,59 @@ export class SandboxController {
     return this.sandboxService.toSandboxDto(sandbox)
   }
 
-  // TODO: Network settings endpoint will not be enabled for now
-  // @Post(':sandboxIdOrName/network-settings')
-  // @ApiOperation({
-  //   summary: 'Update sandbox network settings',
-  //   operationId: 'updateNetworkSettings',
-  // })
-  // @ApiParam({
-  //   name: 'sandboxIdOrName',
-  //   description: 'ID or name of the sandbox',
-  //   type: 'string',
-  // })
-  // @ApiResponse({
-  //   status: 200,
-  //   description: 'Network settings have been updated',
-  //   type: SandboxDto,
-  // })
-  // @UseGuards(OrganizationAuthContextGuard, SandboxAccessGuard)
-  // @RequiredOrganizationResourcePermissions([OrganizationResourcePermission.WRITE_SANDBOXES])
-  // @Audit({
-  //   action: AuditAction.UPDATE_NETWORK_SETTINGS,
-  //   targetType: AuditTarget.SANDBOX,
-  //   targetIdFromRequest: (req) => req.params.sandboxIdOrName,
-  //   targetIdFromResult: (result: SandboxDto) => result?.id,
-  //   requestMetadata: {
-  //     body: (req: TypedRequest<UpdateSandboxNetworkSettingsDto>) => ({
-  //       networkBlockAll: req.body?.networkBlockAll,
-  //       networkAllowList: req.body?.networkAllowList,
-  //     }),
-  //   },
-  // })
-  // async updateNetworkSettings(
-  //   @IsOrganizationAuthContext() authContext: OrganizationAuthContext,
-  //   @Param('sandboxIdOrName') sandboxIdOrName: string,
-  //   @Body() networkSettings: UpdateSandboxNetworkSettingsDto,
-  // ): Promise<SandboxDto> {
-  //   const sandbox = await this.sandboxService.updateNetworkSettings(
-  //     sandboxIdOrName,
-  //     networkSettings.networkBlockAll,
-  //     networkSettings.networkAllowList,
-  //     authContext.organizationId,
-  //   )
-  //   return SandboxDto.fromSandbox(sandbox, '')
-  // }
+  @Post(':sandboxIdOrName/network-settings')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Update sandbox network settings',
+    operationId: 'updateNetworkSettings',
+    description:
+      'Changes outbound network policy on the runner for a running sandbox (for example block all traffic, restore access, or set a CIDR allow list).',
+  })
+  @ApiParam({
+    name: 'sandboxIdOrName',
+    description: 'ID or name of the sandbox',
+    type: 'string',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Network settings have been updated',
+    type: SandboxDto,
+  })
+  @UseGuards(OrganizationAuthContextGuard, SandboxAccessGuard)
+  @RequiredOrganizationResourcePermissions([OrganizationResourcePermission.WRITE_SANDBOXES])
+  @Audit({
+    action: AuditAction.UPDATE_NETWORK_SETTINGS,
+    targetType: AuditTarget.SANDBOX,
+    targetIdFromRequest: (req) => req.params.sandboxIdOrName,
+    targetIdFromResult: (result: SandboxDto) => result?.id,
+    requestMetadata: {
+      body: (req: TypedRequest<UpdateSandboxNetworkSettingsDto>) => ({
+        networkBlockAll: req.body?.networkBlockAll,
+        networkAllowList: req.body?.networkAllowList,
+      }),
+    },
+  })
+  async updateNetworkSettings(
+    @IsOrganizationAuthContext() authContext: OrganizationAuthContext,
+    @Param('sandboxIdOrName') sandboxIdOrName: string,
+    @Body() networkSettings: UpdateSandboxNetworkSettingsDto,
+  ): Promise<SandboxDto> {
+    if (authContext.organization.sandboxLimitedNetworkEgress) {
+      throw new BadRequestError(
+        'Network access is restricted and cannot be overridden at the sandbox level. See https://www.daytona.io/docs/en/network-limits/#tier-based-network-restrictions',
+      )
+    }
+    if (networkSettings.networkBlockAll === undefined && networkSettings.networkAllowList === undefined) {
+      throw new BadRequestError('At least one of networkBlockAll or networkAllowList must be provided')
+    }
+    const sandbox = await this.sandboxService.updateNetworkSettings(
+      sandboxIdOrName,
+      networkSettings.networkBlockAll,
+      networkSettings.networkAllowList,
+      authContext.organizationId,
+    )
+    return this.sandboxService.toSandboxDto(sandbox)
+  }
 
   @Post(':sandboxIdOrName/archive')
   @HttpCode(200)

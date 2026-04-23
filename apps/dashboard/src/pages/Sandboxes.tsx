@@ -3,13 +3,19 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { OrganizationRolePermissionsEnum } from '@daytona/api-client'
 import { OrganizationSuspendedError } from '@/api/errors'
-import { type CommandConfig, useRegisterCommands } from '@/components/CommandPalette'
+import { SandboxTable } from '@/components/SandboxTable'
+import { toast } from 'sonner'
+import { useNavigate } from 'react-router-dom'
+import { useAuth } from 'react-oidc-context'
+import { ForkTreeDialog } from '@/components/ForkTreeDialog'
 import { PageContent, PageHeader, PageLayout, PageTitle } from '@/components/PageLayout'
+import { RecursiveDeleteDialog } from '@/components/RecursiveDeleteDialog'
 import { CreateSandboxSheet } from '@/components/Sandbox/CreateSandboxSheet'
 import SandboxDetailsSheet from '@/components/SandboxDetailsSheet'
-import { SandboxTable } from '@/components/SandboxTable'
+import { type CommandConfig, useRegisterCommands } from '@/components/CommandPalette'
 import { CreateSshAccessSheet } from '@/components/sandboxes/CreateSshAccessSheet'
 import { RevokeSshAccessDialog } from '@/components/sandboxes/RevokeSshAccessDialog'
 import {
@@ -23,297 +29,160 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { DAYTONA_DOCS_URL } from '@/constants/ExternalLinks'
-import { DEFAULT_PAGE_SIZE } from '@/constants/Pagination'
 import { LocalStorageKey } from '@/enums/LocalStorageKey'
 import { RoutePath } from '@/enums/RoutePath'
-import { SnapshotFilters, SnapshotQueryParams, useSnapshotsQuery } from '@/hooks/queries/useSnapshotsQuery'
 import { useApi } from '@/hooks/useApi'
 import { useConfig } from '@/hooks/useConfig'
 import { useNotificationSocket } from '@/hooks/useNotificationSocket'
 import { useRegions } from '@/hooks/useRegions'
-import {
-  DEFAULT_SANDBOX_SORTING,
-  getSandboxesQueryKey,
-  SandboxFilters,
-  SandboxQueryParams,
-  SandboxSorting,
-  useSandboxes,
-} from '@/hooks/useSandboxes'
 import { useSelectedOrganization } from '@/hooks/useSelectedOrganization'
 import { createBulkActionToast } from '@/lib/bulk-action-toast'
 import { handleApiError } from '@/lib/error-handling'
 import { getLocalStorageItem, setLocalStorageItem } from '@/lib/local-storage'
 import { formatDuration, pluralize } from '@/lib/utils'
-import { OrganizationUserRoleEnum, Sandbox, SandboxDesiredState, SandboxState } from '@daytona/api-client'
-import { QueryKey, useQueryClient } from '@tanstack/react-query'
+import { OrganizationUserRoleEnum, Sandbox, SandboxDesiredState, SandboxState, SnapshotDto } from '@daytona/api-client'
 import { PlusIcon } from 'lucide-react'
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useAuth } from 'react-oidc-context'
-import { useNavigate } from 'react-router-dom'
-import { toast } from 'sonner'
 
 const Sandboxes: React.FC = () => {
-  const { sandboxApi, apiKeyApi, toolboxApi } = useApi()
+  const { sandboxApi, apiKeyApi, toolboxApi, snapshotApi } = useApi()
   const { user } = useAuth()
-  const navigate = useNavigate()
   const { notificationSocket } = useNotificationSocket()
   const config = useConfig()
-  const queryClient = useQueryClient()
-  const { selectedOrganization, authenticatedUserOrganizationMember, authenticatedUserHasPermission } =
-    useSelectedOrganization()
 
-  // Pagination
-
-  const [paginationParams, setPaginationParams] = useState({
-    pageIndex: 0,
-    pageSize: DEFAULT_PAGE_SIZE,
-  })
-
-  const handlePaginationChange = useCallback(({ pageIndex, pageSize }: { pageIndex: number; pageSize: number }) => {
-    setPaginationParams({ pageIndex, pageSize })
-  }, [])
-
-  // Filters
-
-  const [filters, setFilters] = useState<SandboxFilters>({})
-
-  const handleFiltersChange = useCallback((filters: SandboxFilters) => {
-    setFilters(filters)
-    setPaginationParams((prev) => ({ ...prev, pageIndex: 0 }))
-  }, [])
-
-  // Sorting
-
-  const [sorting, setSorting] = useState<SandboxSorting>(DEFAULT_SANDBOX_SORTING)
-
-  const handleSortingChange = useCallback((sorting: SandboxSorting) => {
-    setSorting(sorting)
-    setPaginationParams((prev) => ({ ...prev, pageIndex: 0 }))
-  }, [])
-
-  // Sandboxes Data
-
-  const queryParams = useMemo<SandboxQueryParams>(
-    () => ({
-      page: paginationParams.pageIndex + 1, // 1-indexed
-      pageSize: paginationParams.pageSize,
-      filters: filters,
-      sorting: sorting,
-    }),
-    [paginationParams, filters, sorting],
-  )
-
-  const baseQueryKey = useMemo<QueryKey>(
-    () => getSandboxesQueryKey(selectedOrganization?.id),
-    [selectedOrganization?.id],
-  )
-
-  const queryKey = useMemo<QueryKey>(
-    () => getSandboxesQueryKey(selectedOrganization?.id, queryParams),
-    [selectedOrganization?.id, queryParams],
-  )
-
-  const {
-    data: sandboxesData,
-    isLoading: sandboxesDataIsLoading,
-    error: sandboxesDataError,
-    refetch: refetchSandboxesData,
-  } = useSandboxes(queryKey, queryParams)
-
-  useEffect(() => {
-    if (sandboxesDataError) {
-      handleApiError(sandboxesDataError, 'Failed to fetch sandboxes')
-    }
-  }, [sandboxesDataError])
-
-  const updateSandboxInCache = useCallback(
-    (sandboxId: string, updates: Partial<Sandbox>) => {
-      queryClient.setQueryData(queryKey, (oldData: any) => {
-        if (!oldData) return oldData
-        return {
-          ...oldData,
-          items: oldData.items.map((sandbox: Sandbox) =>
-            sandbox.id === sandboxId ? { ...sandbox, ...updates } : sandbox,
-          ),
-        }
-      })
-    },
-    [queryClient, queryKey],
-  )
-
-  /**
-   * Marks all sandbox queries for this organization as stale.
-   *
-   * Useful when sandbox event occurs and we don't have a good way of knowing for which combination of query parameters the sandbox would be shown.
-   *
-   * @param shouldRefetchActiveQueries If true, only active queries will be refetched. Otherwise, no queries will be refetched.
-   */
-  const markAllSandboxQueriesAsStale = useCallback(
-    async (shouldRefetchActiveQueries = false) => {
-      queryClient.invalidateQueries({
-        queryKey: baseQueryKey,
-        refetchType: shouldRefetchActiveQueries ? 'active' : 'none',
-      })
-    },
-    [queryClient, baseQueryKey],
-  )
-
-  /**
-   * Aborts all outgoing refetches for the provided key.
-   *
-   * Useful for preventing refetches from overwriting optimistic updates.
-   *
-   * @param queryKey
-   */
-  const cancelQueryRefetches = useCallback(
-    async (queryKey: QueryKey) => {
-      queryClient.cancelQueries({ queryKey })
-    },
-    [queryClient],
-  )
-
-  // Go to previous page if there are no items on the current page
-
-  useEffect(() => {
-    if (sandboxesData?.items.length === 0 && paginationParams.pageIndex > 0) {
-      setPaginationParams((prev) => ({
-        ...prev,
-        pageIndex: prev.pageIndex - 1,
-      }))
-    }
-  }, [sandboxesData?.items.length, paginationParams.pageIndex])
-
-  // Ephemeral Sandbox States
-
-  const [sandboxIsLoading, setSandboxIsLoading] = useState<Record<string, boolean>>({})
-  const [sandboxStateIsTransitioning, setSandboxStateIsTransitioning] = useState<Record<string, boolean>>({}) // display transition animation
-
-  // Manual Refreshing
-
-  const [sandboxDataIsRefreshing, setSandboxDataIsRefreshing] = useState(false)
-
-  const handleRefresh = useCallback(async () => {
-    setSandboxDataIsRefreshing(true)
-    try {
-      await refetchSandboxesData()
-    } catch (error) {
-      handleApiError(error, 'Failed to refresh sandboxes')
-    } finally {
-      setSandboxDataIsRefreshing(false)
-    }
-  }, [refetchSandboxesData])
-
-  // Delete Sandbox Dialog
-
+  const [sandboxes, setSandboxes] = useState<Sandbox[]>([])
+  const [snapshots, setSnapshots] = useState<SnapshotDto[]>([])
+  const [loadingSandboxes, setLoadingSandboxes] = useState<Record<string, boolean>>({})
+  const [transitioningSandboxes, setTransitioningSandboxes] = useState<Record<string, boolean>>({})
+  const [loadingTable, setLoadingTable] = useState(true)
+  const [loadingSnapshots, setLoadingSnapshots] = useState(true)
   const [sandboxToDelete, setSandboxToDelete] = useState<string | null>(null)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+
+  const [forkTreeSandboxId, setForkTreeSandboxId] = useState<string | null>(null)
+  const [recursiveDeleteSandboxId, setRecursiveDeleteSandboxId] = useState<string | null>(null)
+
+  // Create Snapshot Dialog
+
+  const [sandboxToSnapshot, setSandboxToSnapshot] = useState<string | null>(null)
+  const [snapshotName, setSnapshotName] = useState('')
+  const [snapshotIsLoading, setSnapshotIsLoading] = useState(false)
+
+  const handleCreateSnapshot = (id: string) => {
+    setSandboxToSnapshot(id)
+    setSnapshotName('')
+  }
+
+  const handleFork = async (id: string) => {
+    try {
+      await sandboxApi.forkSandbox(id, {}, selectedOrganization?.id)
+      toast.success('Fork started')
+      await fetchSandboxes()
+    } catch {
+      toast.error('Failed to fork sandbox')
+    }
+  }
+
+  const handleViewForks = (id: string) => {
+    setForkTreeSandboxId(id)
+  }
+
+  const openDeleteDialog = async (id: string) => {
+    try {
+      const forksRes = await sandboxApi.getSandboxForks(id, selectedOrganization?.id)
+      if (forksRes.data.length > 0) {
+        setRecursiveDeleteSandboxId(id)
+        return
+      }
+    } catch {
+      // Fall through to normal delete if fork check fails
+    }
+    setSandboxToDelete(id)
+    setShowDeleteDialog(true)
+  }
 
   // Sandbox Details Drawer
 
   const [selectedSandbox, setSelectedSandbox] = useState<Sandbox | null>(null)
   const [showSandboxDetails, setShowSandboxDetails] = useState(false)
-
-  useEffect(() => {
-    if (!selectedSandbox || !sandboxesData?.items) {
-      return
-    }
-
-    const selectedSandboxInData = sandboxesData.items.find((s) => s.id === selectedSandbox.id)
-
-    if (!selectedSandboxInData) {
-      setSelectedSandbox(null)
-      setShowSandboxDetails(false)
-      return
-    }
-
-    if (selectedSandboxInData !== selectedSandbox) {
-      setSelectedSandbox(selectedSandboxInData)
-    }
-  }, [sandboxesData?.items, selectedSandbox])
-
-  const performSandboxStateOptimisticUpdate = useCallback(
-    (sandboxId: string, newState: SandboxState) => {
-      updateSandboxInCache(sandboxId, { state: newState })
-
-      if (selectedSandbox?.id === sandboxId) {
-        setSelectedSandbox((prev) => (prev ? { ...prev, state: newState } : null))
-      }
-    },
-    [updateSandboxInCache, selectedSandbox?.id],
-  )
-
-  const revertSandboxStateOptimisticUpdate = useCallback(
-    (sandboxId: string, previousState?: SandboxState) => {
-      if (!previousState) {
-        return
-      }
-
-      updateSandboxInCache(sandboxId, { state: previousState })
-
-      if (selectedSandbox?.id === sandboxId) {
-        setSelectedSandbox((prev) => (prev ? { ...prev, state: previousState } : null))
-      }
-    },
-    [updateSandboxInCache, selectedSandbox?.id],
-  )
-
-  // SSH Access Dialogs
-
   const [showCreateSshDialog, setShowCreateSshDialog] = useState(false)
   const [showRevokeSshDialog, setShowRevokeSshDialog] = useState(false)
   const [sshSandboxId, setSshSandboxId] = useState<string>('')
   const createSandboxSheetRef = useRef<{ open: () => void }>(null)
 
-  // Snapshot Filter
-
-  const [snapshotFilters, setSnapshotFilters] = useState<SnapshotFilters>({})
-
-  const handleSnapshotFiltersChange = useCallback((filters: Partial<SnapshotFilters>) => {
-    setSnapshotFilters((prev) => ({ ...prev, ...filters }))
-  }, [])
-
-  const snapshotsQueryParams = useMemo<SnapshotQueryParams>(
-    () => ({
-      page: 1,
-      pageSize: 100,
-      filters: snapshotFilters,
-    }),
-    [snapshotFilters],
-  )
-
-  const {
-    data: snapshotsData,
-    isLoading: snapshotsDataIsLoading,
-    error: snapshotsDataError,
-  } = useSnapshotsQuery(snapshotsQueryParams)
-
-  const snapshotsDataHasMore = useMemo(() => {
-    return snapshotsData && snapshotsData.totalPages > 1
-  }, [snapshotsData])
-
-  useEffect(() => {
-    if (snapshotsDataError) {
-      handleApiError(snapshotsDataError, 'Failed to fetch snapshots')
-    }
-  }, [snapshotsDataError])
-
   // Region Filter
 
   const { availableRegions: regionsData, loadingAvailableRegions: regionsDataIsLoading, getRegionName } = useRegions()
 
-  // Subscribe to Sandbox Events
+  const navigate = useNavigate()
+
+  const { selectedOrganization, authenticatedUserOrganizationMember, authenticatedUserHasPermission } =
+    useSelectedOrganization()
+
+  const fetchSnapshots = useCallback(async () => {
+    if (!selectedOrganization) {
+      return
+    }
+    setLoadingSnapshots(true)
+    try {
+      // TODO: Implement snapshot search by input
+      // e.g. "Search to load more results"
+      const response = await snapshotApi.getAllSnapshots(selectedOrganization.id)
+      setSnapshots(response.data.items ?? [])
+    } catch (error) {
+      console.error('Failed to fetch snapshots', error)
+    } finally {
+      setLoadingSnapshots(false)
+    }
+  }, [selectedOrganization, snapshotApi])
+
+  const fetchSandboxes = useCallback(
+    async (showTableLoadingState = true) => {
+      if (!selectedOrganization) {
+        return
+      }
+      if (showTableLoadingState) {
+        setLoadingTable(true)
+      }
+      try {
+        const sandboxes = (await sandboxApi.listSandboxes(selectedOrganization.id)).data
+        setSandboxes(sandboxes)
+      } catch (error) {
+        handleApiError(error, 'Failed to fetch sandboxes')
+      } finally {
+        setLoadingTable(false)
+      }
+    },
+    [sandboxApi, selectedOrganization],
+  )
+
+  useEffect(() => {
+    fetchSandboxes()
+    fetchSnapshots()
+  }, [fetchSandboxes, fetchSnapshots])
+
+  useEffect(() => {
+    if (selectedSandbox) {
+      const updatedSandbox = sandboxes.find((s) => s.id === selectedSandbox.id)
+      if (updatedSandbox && updatedSandbox !== selectedSandbox) {
+        setSelectedSandbox(updatedSandbox)
+      }
+    }
+  }, [sandboxes, selectedSandbox])
+
+  useEffect(() => {
+    if (selectedSandbox && !sandboxes.some((s) => s.id === selectedSandbox.id)) {
+      setSelectedSandbox(null)
+      setShowSandboxDetails(false)
+    }
+  }, [sandboxes, selectedSandbox])
 
   useEffect(() => {
     const handleSandboxCreatedEvent = (sandbox: Sandbox) => {
-      const isFirstPage = paginationParams.pageIndex === 0
-      const isDefaultFilters = Object.keys(filters).length === 0
-      const isDefaultSorting =
-        sorting.field === DEFAULT_SANDBOX_SORTING.field && sorting.direction === DEFAULT_SANDBOX_SORTING.direction
-
-      const shouldRefetchActiveQueries = isFirstPage && isDefaultFilters && isDefaultSorting
-
-      markAllSandboxQueriesAsStale(shouldRefetchActiveQueries)
+      if (!sandboxes.some((s) => s.id === sandbox.id)) {
+        setSandboxes((prev) => [sandbox, ...prev])
+      }
     }
 
     const handleSandboxStateUpdatedEvent = (data: {
@@ -321,25 +190,13 @@ const Sandboxes: React.FC = () => {
       oldState: SandboxState
       newState: SandboxState
     }) => {
-      // warm pool sandboxes
-      if (data.oldState === data.newState && data.newState === SandboxState.STARTED) {
-        handleSandboxCreatedEvent(data.sandbox)
-        return
+      if (data.newState === SandboxState.DESTROYED) {
+        setSandboxes((prev) => prev.filter((s) => s.id !== data.sandbox.id))
+      } else if (!sandboxes.some((s) => s.id === data.sandbox.id)) {
+        setSandboxes((prev) => [data.sandbox, ...prev])
+      } else {
+        setSandboxes((prev) => prev.map((s) => (s.id === data.sandbox.id ? data.sandbox : s)))
       }
-
-      let updatedState = data.newState
-
-      // error,build_failed | destroyed should be displayed as destroyed in the UI
-      if (
-        data.sandbox.desiredState === SandboxDesiredState.DESTROYED &&
-        (data.newState === SandboxState.ERROR || data.newState === SandboxState.BUILD_FAILED)
-      ) {
-        updatedState = SandboxState.DESTROYED
-      }
-
-      performSandboxStateOptimisticUpdate(data.sandbox.id, updatedState)
-
-      markAllSandboxQueriesAsStale()
     }
 
     const handleSandboxDesiredStateUpdatedEvent = (data: {
@@ -347,19 +204,13 @@ const Sandboxes: React.FC = () => {
       oldDesiredState: SandboxDesiredState
       newDesiredState: SandboxDesiredState
     }) => {
-      // error,build_failed | destroyed should be displayed as destroyed in the UI
-
-      if (data.newDesiredState !== SandboxDesiredState.DESTROYED) {
-        return
+      if (
+        data.newDesiredState === SandboxDesiredState.DESTROYED &&
+        data.sandbox.state &&
+        ([SandboxState.ERROR, SandboxState.BUILD_FAILED] as SandboxState[]).includes(data.sandbox.state)
+      ) {
+        setSandboxes((prev) => prev.filter((s) => s.id !== data.sandbox.id))
       }
-
-      if (data.sandbox.state !== SandboxState.ERROR && data.sandbox.state !== SandboxState.BUILD_FAILED) {
-        return
-      }
-
-      performSandboxStateOptimisticUpdate(data.sandbox.id, SandboxState.DESTROYED)
-
-      markAllSandboxQueriesAsStale()
     }
 
     if (!notificationSocket) {
@@ -375,32 +226,24 @@ const Sandboxes: React.FC = () => {
       notificationSocket.off('sandbox.state.updated', handleSandboxStateUpdatedEvent)
       notificationSocket.off('sandbox.desired-state.updated', handleSandboxDesiredStateUpdatedEvent)
     }
-  }, [
-    filters,
-    markAllSandboxQueriesAsStale,
-    notificationSocket,
-    paginationParams.pageIndex,
-    performSandboxStateOptimisticUpdate,
-    sorting.direction,
-    sorting.field,
-  ])
-
-  // Sandbox Action Handlers
+  }, [notificationSocket, sandboxes])
 
   const handleStart = async (id: string) => {
-    setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
-    setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: true }))
+    setLoadingSandboxes((prev) => ({ ...prev, [id]: true }))
+    setTransitioningSandboxes((prev) => ({ ...prev, [id]: true }))
 
-    const sandboxToStart = sandboxesData?.items.find((s) => s.id === id)
+    const sandboxToStart = sandboxes.find((s) => s.id === id)
     const previousState = sandboxToStart?.state
 
-    await cancelQueryRefetches(queryKey)
-    performSandboxStateOptimisticUpdate(id, SandboxState.STARTING)
+    setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: SandboxState.STARTING } : s)))
+
+    if (selectedSandbox?.id === id) {
+      setSelectedSandbox((prev) => (prev ? { ...prev, state: SandboxState.STARTING } : null))
+    }
 
     try {
       await sandboxApi.startSandbox(id, selectedOrganization?.id)
       toast.success(`Starting sandbox with ID: ${id}`)
-      await markAllSandboxQueriesAsStale()
     } catch (error) {
       handleApiError(error, 'Failed to start sandbox', {
         action:
@@ -412,49 +255,53 @@ const Sandboxes: React.FC = () => {
             </Button>
           ) : undefined,
       })
-      revertSandboxStateOptimisticUpdate(id, previousState)
+      setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: previousState } : s)))
+      if (selectedSandbox?.id === id && previousState) {
+        setSelectedSandbox((prev) => (prev ? { ...prev, state: previousState } : null))
+      }
     } finally {
-      setSandboxIsLoading((prev) => ({ ...prev, [id]: false }))
+      setLoadingSandboxes((prev) => ({ ...prev, [id]: false }))
       setTimeout(() => {
-        setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: false }))
+        setTransitioningSandboxes((prev) => ({ ...prev, [id]: false }))
       }, 2000)
     }
   }
 
   const handleRecover = async (id: string) => {
-    setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
-    setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: true }))
+    setLoadingSandboxes((prev) => ({ ...prev, [id]: true }))
+    setTransitioningSandboxes((prev) => ({ ...prev, [id]: true }))
 
-    const sandboxToRecover = sandboxesData?.items.find((s) => s.id === id)
+    const sandboxToRecover = sandboxes.find((s) => s.id === id)
     const previousState = sandboxToRecover?.state
 
-    await cancelQueryRefetches(queryKey)
-    performSandboxStateOptimisticUpdate(id, SandboxState.STARTING)
+    setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: SandboxState.STARTING } : s)))
 
     try {
       await sandboxApi.recoverSandbox(id, selectedOrganization?.id)
       toast.success('Sandbox recovered. Restarting...')
-      await markAllSandboxQueriesAsStale()
     } catch (error) {
       handleApiError(error, 'Failed to recover sandbox')
-      revertSandboxStateOptimisticUpdate(id, previousState)
+      setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: previousState } : s)))
     } finally {
-      setSandboxIsLoading((prev) => ({ ...prev, [id]: false }))
+      setLoadingSandboxes((prev) => ({ ...prev, [id]: false }))
       setTimeout(() => {
-        setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: false }))
+        setTransitioningSandboxes((prev) => ({ ...prev, [id]: false }))
       }, 2000)
     }
   }
 
   const handleStop = async (id: string) => {
-    setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
-    setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: true }))
+    setLoadingSandboxes((prev) => ({ ...prev, [id]: true }))
+    setTransitioningSandboxes((prev) => ({ ...prev, [id]: true }))
 
-    const sandboxToStop = sandboxesData?.items.find((s) => s.id === id)
+    const sandboxToStop = sandboxes.find((s) => s.id === id)
     const previousState = sandboxToStop?.state
 
-    await cancelQueryRefetches(queryKey)
-    performSandboxStateOptimisticUpdate(id, SandboxState.STOPPING)
+    setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: SandboxState.STOPPING } : s)))
+
+    if (selectedSandbox?.id === id) {
+      setSelectedSandbox((prev) => (prev ? { ...prev, state: SandboxState.STOPPING } : null))
+    }
 
     try {
       await sandboxApi.stopSandbox(id, selectedOrganization?.id)
@@ -466,27 +313,31 @@ const Sandboxes: React.FC = () => {
             }
           : undefined,
       )
-      await markAllSandboxQueriesAsStale()
     } catch (error) {
       handleApiError(error, 'Failed to stop sandbox')
-      revertSandboxStateOptimisticUpdate(id, previousState)
+      setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: previousState } : s)))
+      if (selectedSandbox?.id === id && previousState) {
+        setSelectedSandbox((prev) => (prev ? { ...prev, state: previousState } : null))
+      }
     } finally {
-      setSandboxIsLoading((prev) => ({ ...prev, [id]: false }))
+      setLoadingSandboxes((prev) => ({ ...prev, [id]: false }))
       setTimeout(() => {
-        setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: false }))
+        setTransitioningSandboxes((prev) => ({ ...prev, [id]: false }))
       }, 2000)
     }
   }
 
   const handleDelete = async (id: string) => {
-    setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
-    setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: true }))
+    setLoadingSandboxes((prev) => ({ ...prev, [id]: true }))
 
-    const sandboxToDelete = sandboxesData?.items.find((s) => s.id === id)
+    const sandboxToDelete = sandboxes.find((s) => s.id === id)
     const previousState = sandboxToDelete?.state
 
-    await cancelQueryRefetches(queryKey)
-    performSandboxStateOptimisticUpdate(id, SandboxState.DESTROYING)
+    setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: SandboxState.DESTROYING } : s)))
+
+    if (selectedSandbox?.id === id) {
+      setSelectedSandbox((prev) => (prev ? { ...prev, state: SandboxState.DESTROYING } : null))
+    }
 
     try {
       await sandboxApi.deleteSandbox(id, selectedOrganization?.id)
@@ -499,43 +350,64 @@ const Sandboxes: React.FC = () => {
       }
 
       toast.success(`Deleting sandbox with ID:  ${id}`)
-
-      await markAllSandboxQueriesAsStale()
     } catch (error) {
       handleApiError(error, 'Failed to delete sandbox')
-      revertSandboxStateOptimisticUpdate(id, previousState)
+      setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: previousState } : s)))
+      if (selectedSandbox?.id === id && previousState) {
+        setSelectedSandbox((prev) => (prev ? { ...prev, state: previousState } : null))
+      }
     } finally {
-      setSandboxIsLoading((prev) => ({ ...prev, [id]: false }))
-      setTimeout(() => {
-        setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: false }))
-      }, 2000)
+      setLoadingSandboxes((prev) => ({ ...prev, [id]: false }))
     }
   }
 
   const handleArchive = async (id: string) => {
-    setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
-    setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: true }))
+    setLoadingSandboxes((prev) => ({ ...prev, [id]: true }))
 
-    const sandboxToArchive = sandboxesData?.items.find((s) => s.id === id)
+    const sandboxToArchive = sandboxes.find((s) => s.id === id)
     const previousState = sandboxToArchive?.state
 
-    await cancelQueryRefetches(queryKey)
-    performSandboxStateOptimisticUpdate(id, SandboxState.ARCHIVING)
+    setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: SandboxState.ARCHIVING } : s)))
+
+    if (selectedSandbox?.id === id) {
+      setSelectedSandbox((prev) => (prev ? { ...prev, state: SandboxState.ARCHIVING } : null))
+    }
 
     try {
       await sandboxApi.archiveSandbox(id, selectedOrganization?.id)
       toast.success(`Archiving sandbox with ID: ${id}`)
-      await markAllSandboxQueriesAsStale()
     } catch (error) {
       handleApiError(error, 'Failed to archive sandbox')
-      revertSandboxStateOptimisticUpdate(id, previousState)
+      setSandboxes((prev) => prev.map((s) => (s.id === id ? { ...s, state: previousState } : s)))
+      if (selectedSandbox?.id === id && previousState) {
+        setSelectedSandbox((prev) => (prev ? { ...prev, state: previousState } : null))
+      }
     } finally {
-      setSandboxIsLoading((prev) => ({ ...prev, [id]: false }))
-      setTimeout(() => {
-        setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: false }))
-      }, 2000)
+      setLoadingSandboxes((prev) => ({ ...prev, [id]: false }))
     }
   }
+
+  const performSandboxStateOptimisticUpdate = useCallback(
+    (sandboxId: string, newState: SandboxState) => {
+      if (selectedSandbox?.id === sandboxId) {
+        setSelectedSandbox((prev) => (prev ? { ...prev, state: newState } : null))
+      }
+    },
+    [selectedSandbox?.id],
+  )
+
+  const revertSandboxStateOptimisticUpdate = useCallback(
+    (sandboxId: string, previousState?: SandboxState) => {
+      if (!previousState) {
+        return
+      }
+
+      if (selectedSandbox?.id === sandboxId) {
+        setSelectedSandbox((prev) => (prev ? { ...prev, state: previousState } : null))
+      }
+    },
+    [selectedSandbox?.id],
+  )
 
   // todo(rpavlini): we should refactor this and move to react-query mutations
   const executeBulkAction = useCallback(
@@ -557,9 +429,7 @@ const Sandboxes: React.FC = () => {
         canceledTitle: string
       }
     }) => {
-      await cancelQueryRefetches(queryKey)
-
-      const previousStatesById = new Map((sandboxesData?.items ?? []).map((sandbox) => [sandbox.id, sandbox.state]))
+      const previousStatesById = new Map((sandboxes ?? []).map((sandbox) => [sandbox.id, sandbox.state]))
 
       let isCancelled = false
       let processedCount = 0
@@ -584,8 +454,10 @@ const Sandboxes: React.FC = () => {
             action: { label: 'Cancel', onClick: onCancel },
           })
 
-          setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
-          setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: true }))
+          setLoadingSandboxes((prev) => ({ ...prev, [id]: true }))
+          // setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
+          setTransitioningSandboxes((prev) => ({ ...prev, [id]: true }))
+          // setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: true }))
           performSandboxStateOptimisticUpdate(id, optimisticState)
 
           try {
@@ -596,14 +468,13 @@ const Sandboxes: React.FC = () => {
             revertSandboxStateOptimisticUpdate(id, previousStatesById.get(id))
             console.error(`${actionName} sandbox failed`, id, error)
           } finally {
-            setSandboxIsLoading((prev) => ({ ...prev, [id]: false }))
+            setLoadingSandboxes((prev) => ({ ...prev, [id]: false }))
             setTimeout(() => {
-              setSandboxStateIsTransitioning((prev) => ({ ...prev, [id]: false }))
+              setTransitioningSandboxes((prev) => ({ ...prev, [id]: false }))
             }, 2000)
           }
         }
 
-        await markAllSandboxQueriesAsStale()
         bulkToast.result({ successCount, failureCount }, toastMessages)
       } catch (error) {
         console.error(`${actionName} sandboxes failed`, error)
@@ -612,14 +483,7 @@ const Sandboxes: React.FC = () => {
 
       return { successCount, failureCount }
     },
-    [
-      cancelQueryRefetches,
-      queryKey,
-      sandboxesData?.items,
-      performSandboxStateOptimisticUpdate,
-      revertSandboxStateOptimisticUpdate,
-      markAllSandboxQueriesAsStale,
-    ],
+    [sandboxes, performSandboxStateOptimisticUpdate, revertSandboxStateOptimisticUpdate],
   )
 
   const handleBulkStart = (ids: string[]) =>
@@ -688,11 +552,11 @@ const Sandboxes: React.FC = () => {
 
   const getPortPreviewUrl = useCallback(
     async (sandboxId: string, port: number): Promise<string> => {
-      setSandboxIsLoading((prev) => ({ ...prev, [sandboxId]: true }))
+      setLoadingSandboxes((prev) => ({ ...prev, [sandboxId]: true }))
       try {
         return (await sandboxApi.getSignedPortPreviewUrl(sandboxId, port, selectedOrganization?.id)).data.url
       } finally {
-        setSandboxIsLoading((prev) => ({ ...prev, [sandboxId]: false }))
+        setLoadingSandboxes((prev) => ({ ...prev, [sandboxId]: false }))
       }
     },
     [sandboxApi, selectedOrganization],
@@ -709,7 +573,7 @@ const Sandboxes: React.FC = () => {
   }
 
   const handleVnc = async (id: string) => {
-    setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
+    setLoadingSandboxes((prev) => ({ ...prev, [id]: true }))
 
     // Notify user immediately that we're checking VNC status
     toast.info('Checking VNC desktop status...')
@@ -788,7 +652,7 @@ const Sandboxes: React.FC = () => {
     } catch (error) {
       handleApiError(error, 'Failed to check VNC status')
     } finally {
-      setSandboxIsLoading((prev) => ({ ...prev, [id]: false }))
+      setLoadingSandboxes((prev) => ({ ...prev, [id]: false }))
     }
   }
 
@@ -806,13 +670,13 @@ const Sandboxes: React.FC = () => {
 
   const handleScreenRecordings = async (id: string) => {
     // Check if sandbox is started
-    const sandbox = sandboxesData?.items?.find((s) => s.id === id)
+    const sandbox = sandboxes.find((s) => s.id === id)
     if (!sandbox || sandbox.state !== SandboxState.STARTED) {
       toast.error('Sandbox must be started to access Screen Recordings')
       return
     }
 
-    setSandboxIsLoading((prev) => ({ ...prev, [id]: true }))
+    setLoadingSandboxes((prev) => ({ ...prev, [id]: true }))
     try {
       const portPreviewUrl = await getPortPreviewUrl(id, 33333)
       window.open(portPreviewUrl, '_blank')
@@ -820,7 +684,7 @@ const Sandboxes: React.FC = () => {
     } catch (error) {
       handleApiError(error, 'Failed to open Screen Recordings')
     } finally {
-      setSandboxIsLoading((prev) => ({ ...prev, [id]: false }))
+      setLoadingSandboxes((prev) => ({ ...prev, [id]: false }))
     }
   }
 
@@ -859,7 +723,6 @@ const Sandboxes: React.FC = () => {
 
   // Redirect user to the onboarding page if they haven't created an api key yet
   // Perform only once per user
-
   useEffect(() => {
     const onboardIfNeeded = async () => {
       if (!selectedOrganization) {
@@ -894,19 +757,28 @@ const Sandboxes: React.FC = () => {
       <PageHeader>
         <PageTitle>Sandboxes</PageTitle>
         <div className="flex items-center gap-2 ml-auto">
+          {!loadingTable && sandboxes.length === 0 && (
+            <>
+              <Button variant="link" className="text-primary" onClick={() => navigate(RoutePath.ONBOARDING)} size="sm">
+                Onboarding guide
+              </Button>
+              <Button variant="link" className="text-primary" asChild size="sm">
+                <a href={DAYTONA_DOCS_URL} target="_blank" rel="noopener noreferrer" className="text-primary">
+                  Docs
+                </a>
+              </Button>
+            </>
+          )}
           {canCreateSandbox && <CreateSandboxSheet ref={createSandboxSheetRef} />}
         </div>
       </PageHeader>
       <PageContent size="full" className="flex-1 max-h-[calc(100vh-65px)]">
         <SandboxTable
-          sandboxIsLoading={sandboxIsLoading}
-          sandboxStateIsTransitioning={sandboxStateIsTransitioning}
+          sandboxIsLoading={loadingSandboxes}
+          sandboxStateIsTransitioning={transitioningSandboxes}
           handleStart={handleStart}
           handleStop={handleStop}
-          handleDelete={(id: string) => {
-            setSandboxToDelete(id)
-            setShowDeleteDialog(true)
-          }}
+          handleDelete={openDeleteDialog}
           handleBulkDelete={handleBulkDelete}
           handleBulkStart={handleBulkStart}
           handleBulkStop={handleBulkStop}
@@ -916,34 +788,22 @@ const Sandboxes: React.FC = () => {
           getWebTerminalUrl={getWebTerminalUrl}
           handleCreateSshAccess={openCreateSshDialog}
           handleRevokeSshAccess={openRevokeSshDialog}
-          handleRefresh={handleRefresh}
-          isRefreshing={sandboxDataIsRefreshing}
-          data={sandboxesData?.items || []}
-          loading={sandboxesDataIsLoading}
-          snapshots={snapshotsData?.items || []}
-          snapshotsDataIsLoading={snapshotsDataIsLoading}
-          snapshotsDataHasMore={snapshotsDataHasMore}
-          onChangeSnapshotSearchValue={(name?: string) => handleSnapshotFiltersChange({ name })}
-          regionsData={regionsData || []}
-          regionsDataIsLoading={regionsDataIsLoading}
+          data={sandboxes}
+          loading={loadingTable}
+          snapshots={snapshots}
           onRowClick={(sandbox: Sandbox) => {
             setSelectedSandbox(sandbox)
             setShowSandboxDetails(true)
           }}
-          pageCount={sandboxesData?.totalPages || 0}
-          totalItems={sandboxesData?.total || 0}
-          onPaginationChange={handlePaginationChange}
-          pagination={{
-            pageIndex: paginationParams.pageIndex,
-            pageSize: paginationParams.pageSize,
-          }}
-          sorting={sorting}
-          onSortingChange={handleSortingChange}
-          filters={filters}
-          onFiltersChange={handleFiltersChange}
+          loadingSnapshots={loadingSnapshots}
+          regionsData={regionsData}
+          regionsDataIsLoading={regionsDataIsLoading}
           handleRecover={handleRecover}
           getRegionName={getRegionName}
           handleScreenRecordings={handleScreenRecordings}
+          handleCreateSnapshot={handleCreateSnapshot}
+          handleFork={handleFork}
+          handleViewForks={handleViewForks}
         />
 
         {sandboxToDelete && (
@@ -968,9 +828,61 @@ const Sandboxes: React.FC = () => {
                 <AlertDialogAction
                   variant="destructive"
                   onClick={() => handleDelete(sandboxToDelete)}
-                  disabled={sandboxIsLoading[sandboxToDelete]}
+                  disabled={loadingSandboxes[sandboxToDelete]}
                 >
-                  {sandboxIsLoading[sandboxToDelete] ? 'Deleting...' : 'Delete'}
+                  {loadingSandboxes[sandboxToDelete] ? 'Deleting...' : 'Delete'}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        )}
+
+        {sandboxToSnapshot && (
+          <AlertDialog
+            open={!!sandboxToSnapshot}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setSandboxToSnapshot(null)
+                setSnapshotName('')
+              }
+            }}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Create Snapshot</AlertDialogTitle>
+                <AlertDialogDescription>Enter a name for the new snapshot.</AlertDialogDescription>
+              </AlertDialogHeader>
+              <Input
+                value={snapshotName}
+                onChange={(e) => setSnapshotName(e.target.value)}
+                placeholder="Snapshot name"
+                disabled={snapshotIsLoading}
+              />
+              <AlertDialogFooter>
+                <AlertDialogCancel disabled={snapshotIsLoading}>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  disabled={!snapshotName.trim() || snapshotIsLoading}
+                  onClick={async (e) => {
+                    e.preventDefault()
+                    if (!sandboxToSnapshot || !snapshotName.trim()) return
+                    setSnapshotIsLoading(true)
+                    try {
+                      await sandboxApi.createSandboxSnapshot(
+                        sandboxToSnapshot,
+                        { name: snapshotName.trim() },
+                        selectedOrganization?.id,
+                      )
+                      toast.success('Snapshot creation started')
+                      setSandboxToSnapshot(null)
+                      setSnapshotName('')
+                    } catch (error) {
+                      handleApiError(error, 'Failed to create snapshot')
+                    } finally {
+                      setSnapshotIsLoading(false)
+                    }
+                  }}
+                >
+                  {snapshotIsLoading ? 'Creating...' : 'Create'}
                 </AlertDialogAction>
               </AlertDialogFooter>
             </AlertDialogContent>
@@ -1003,13 +915,12 @@ const Sandboxes: React.FC = () => {
           sandbox={selectedSandbox}
           open={showSandboxDetails}
           onOpenChange={setShowSandboxDetails}
-          sandboxIsLoading={sandboxIsLoading}
+          sandboxIsLoading={loadingSandboxes}
           handleStart={handleStart}
           handleStop={handleStop}
-          handleDelete={(id) => {
-            setSandboxToDelete(id)
-            setShowDeleteDialog(true)
+          handleDelete={async (id) => {
             setShowSandboxDetails(false)
+            await openDeleteDialog(id)
           }}
           handleArchive={handleArchive}
           getWebTerminalUrl={getWebTerminalUrl}
@@ -1018,6 +929,25 @@ const Sandboxes: React.FC = () => {
           handleRecover={handleRecover}
           getRegionName={getRegionName}
         />
+
+        {forkTreeSandboxId && (
+          <ForkTreeDialog
+            sandboxId={forkTreeSandboxId}
+            open={!!forkTreeSandboxId}
+            onClose={() => setForkTreeSandboxId(null)}
+          />
+        )}
+
+        {recursiveDeleteSandboxId && (
+          <RecursiveDeleteDialog
+            sandboxId={recursiveDeleteSandboxId}
+            open={!!recursiveDeleteSandboxId}
+            onClose={() => setRecursiveDeleteSandboxId(null)}
+            onDeleted={async () => {
+              await fetchSandboxes()
+            }}
+          />
+        )}
       </PageContent>
     </PageLayout>
   )

@@ -17,6 +17,7 @@ import { SandboxDesiredStateUpdatedEvent } from '../events/sandbox-desired-state
 import { SandboxPublicStatusUpdatedEvent } from '../events/sandbox-public-status-updated.event'
 import { SandboxOrganizationUpdatedEvent } from '../events/sandbox-organization-updated.event'
 import { SandboxLookupCacheInvalidationService } from '../services/sandbox-lookup-cache-invalidation.service'
+import { SandboxFork } from '../entities/sandbox-fork.entity'
 
 @Injectable()
 export class SandboxRepository extends BaseRepository<Sandbox> {
@@ -30,7 +31,7 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
     super(dataSource, eventEmitter, Sandbox)
   }
 
-  async insert(sandbox: Sandbox): Promise<Sandbox> {
+  async insert(sandbox: Sandbox, parentId?: string): Promise<Sandbox> {
     const now = new Date()
     if (!sandbox.createdAt) {
       sandbox.createdAt = now
@@ -45,6 +46,14 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
     await this.dataSource.transaction(async (entityManager) => {
       await entityManager.insert(Sandbox, sandbox)
       await this.upsertLastActivity(entityManager, sandbox.id, sandbox.createdAt)
+      sandbox.lastActivityAt = { sandboxId: sandbox.id, lastActivityAt: sandbox.createdAt }
+
+      if (parentId) {
+        await entityManager.insert(SandboxFork, {
+          parentId,
+          childId: sandbox.id,
+        })
+      }
     })
 
     this.invalidateLookupCacheOnInsert(sandbox)
@@ -109,6 +118,7 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
 
       if (previousSandbox.state !== sandbox.state || previousSandbox.organizationId !== sandbox.organizationId) {
         await this.upsertLastActivity(entityManager, id, sandbox.updatedAt)
+        sandbox.lastActivityAt = { sandboxId: id, lastActivityAt: sandbox.updatedAt }
       }
     })
 
@@ -166,6 +176,7 @@ export class SandboxRepository extends BaseRepository<Sandbox> {
 
       if (previousSandbox.state !== sandbox.state || previousSandbox.organizationId !== sandbox.organizationId) {
         await this.upsertLastActivity(entityManager, id, sandbox.updatedAt)
+        sandbox.lastActivityAt = { sandboxId: id, lastActivityAt: sandbox.updatedAt }
       }
 
       this.emitUpdateEvents(sandbox, previousSandbox)
