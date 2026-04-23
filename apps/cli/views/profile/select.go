@@ -183,6 +183,7 @@ func (m profileListModel) delete() (tea.Model, tea.Cmd) {
 		if err != nil {
 			m.errMsg = err.Error()
 		}
+		m.profiles = m.config.Profiles
 	}
 
 	return m, tea.ClearScreen
@@ -283,7 +284,8 @@ func SelectProfile(
 			onEdit:      onEdit,
 			onDelete:    onDelete,
 		},
-		tea.WithAltScreen())
+		tea.WithAltScreen(),
+	)
 
 	_, err := p.Run()
 	return err
